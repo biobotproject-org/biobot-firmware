@@ -1,0 +1,12 @@
+# Per-node secrets and identity (copy config.example.h to config.h)
+Firmware/**/config.h
+
+# Host-side test binaries
+Firmware/**/test/*.out
+Firmware/**/test/test_anomaly
+
+# Editor and OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
