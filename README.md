@@ -29,7 +29,7 @@ The detector (`Firmware/Notecard/anomaly.h`) runs on the node so an alert can
 leave the module the moment it is confirmed, rather than waiting for the next
 batch. It looks at two kinds of evidence:
 
-- **Absolute limits.** PM2.5 above 55 µg/m³ (alert) or 150 µg/m³ (critical),
+- **Absolute limits.** PM2.5 above 35 µg/m³ (watch), 55 µg/m³ (alert) or 150 µg/m³ (critical),
   temperature above 50 °C.
 - **Deviation from this node's own baseline.** A slow exponential moving
   average learns what "normal" looks like at this exact spot. Smoke and
@@ -44,7 +44,7 @@ maps to a severity:
 | Severity | Meaning | Sent as alert? |
 | --- | --- | --- |
 | `none` | nothing unusual | no |
-| `watch` | one weak signal, e.g. gas resistance drop alone | no, flagged in batch data |
+| `watch` | one weak signal, e.g. PM2.5 between 35 and 55 or a gas resistance drop alone | no, flagged in batch data |
 | `alert` | one strong signal or two weak ones | yes |
 | `critical` | several signals corroborating each other, or very heavy smoke | yes |
 | `fault` | particulate sensor obstructed or failing for 10 samples | yes |
@@ -62,8 +62,8 @@ tuned per deployment.
   "deviceId": "biobot-001",
   "event": "raised",
   "severity": "critical",
-  "score": 4,
-  "signals": ["pm25_high", "humidity_drop", "gas_resistance_drop"],
+  "score": 5,
+  "signals": ["pm25_elevated", "pm25_high", "humidity_drop", "gas_resistance_drop"],
   "timestamp": "2026-08-14T21:07:30Z",
   "readings": { "temperature": 31.2, "humidity": 18.5, "pressure": 912.4,
                 "gasResistance": 38.1, "pm1": 52.0, "pm25": 88.3, "pm10": 101.0,

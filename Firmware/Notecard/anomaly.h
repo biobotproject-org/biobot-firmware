@@ -50,6 +50,7 @@ enum Signal : uint16_t {
   SIG_GAS_DROP        = 1 << 5,  // gas resistance well below local baseline
   SIG_PM_OBSTRUCTED   = 1 << 6,  // sensor fault: particulate optics blocked
   SIG_PM_SENSOR_FAIL  = 1 << 7,  // sensor fault: particulate reads failing
+  SIG_PM25_ELEVATED   = 1 << 8,  // PM2.5 above the watch limit (weak signal)
 };
 
 enum class Severity : uint8_t {
@@ -62,6 +63,7 @@ enum class Severity : uint8_t {
 
 struct Config {
   // Absolute limits
+  float pm25WatchUgm3 = 35.0f;      // clearly above a clean-air background; watch only
   float pm25AlertUgm3 = 55.0f;      // roughly "unhealthy for sensitive groups"
   float pm25CriticalUgm3 = 150.0f;  // heavy smoke
   float tempHighC = 50.0f;          // hotter than a sunny enclosure should get
@@ -148,7 +150,7 @@ private:
   bool baselineInit_ = false;
   float bTemp_ = 0, bHum_ = 0, bGas_ = 0, bPm25_ = 0;
 
-  Gate gPmHigh_, gPmCrit_, gTempHigh_, gTempRise_, gHumDrop_, gGasDrop_;
+  Gate gPmElev_, gPmHigh_, gPmCrit_, gTempHigh_, gTempRise_, gHumDrop_, gGasDrop_;
   uint8_t obstructedCount_ = 0;
   uint8_t failCount_ = 0;
 
