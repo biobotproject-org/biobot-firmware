@@ -1,7 +1,9 @@
-// config.example.h - per-node identity and secrets.
+// config.example.h - per-node identity.
 //
 // Copy this file to config.h in the same folder and fill in your values.
-// config.h is listed in .gitignore so credentials never land in the repo.
+// config.h is git-ignored so per-node settings never land in the repo.
+// The node carries no API credentials: the Notehub route that forwards
+// notes to the BioBot API adds the server's token itself.
 #pragma once
 
 // Blues Notehub product UID for this fleet (Notehub -> Project -> Settings).
@@ -12,11 +14,6 @@
 // own schedule, but alert notes are still pushed immediately because they are
 // added with sync:true.
 #define NOTEHUB_MODE "continuous"
-
-// BioBot API. The Notehub route forwards each note to these endpoints.
-#define API_AUTH_TOKEN "replace-me"
-#define API_DEVICES_URL "https://example.com/devices"
-#define API_ALERTS_URL "https://example.com/alerts"
 
 // This node.
 #define DEVICE_ID "biobot-001"

@@ -82,11 +82,18 @@ periodic reminder), or `cleared`.
 2. Install these libraries: Adafruit BME680, Adafruit Unified Sensor,
    SparkFun BMV080, Blues Wireless Notecard.
 3. Copy `Firmware/Notecard/config.example.h` to `Firmware/Notecard/config.h`
-   and fill in your Notehub product UID, API URLs, auth token, and device
-   identity. `config.h` is git-ignored.
+   and fill in your Notehub product UID and device identity. `config.h` is
+   git-ignored. The node holds no API credentials; the Notehub route adds
+   the server's token when it forwards notes (see the biobot-cloud README).
 4. Open `Firmware/Notecard/Notecard.ino` and upload.
 
 Wiring defaults are at the top of the sketch: I2C on A4/A5 at 100 kHz.
+
+## Continuous integration
+
+Every push and pull request compiles the sketch for the Arduino Nano ESP32
+with `arduino-cli` and runs the detector's host tests. See
+`.github/workflows/build.yml`.
 
 ## Testing the detector on your computer
 
