@@ -56,6 +56,8 @@ static void test_pm25_alert_needs_confirmation() {
   r = feed(d, smoke, 1, now);
   CHECK(r.severity == Severity::ALERT);  // confirmed
   CHECK(r.signals & SIG_PM25_HIGH);
+  CHECK(r.signals & SIG_PM25_ELEVATED);  // 80 is above both limits
+  CHECK(r.score == 3);
   CHECK(r.notify);
   CHECK(r.newEvent);
   CHECK(!r.cleared);
@@ -75,7 +77,7 @@ static void test_corroboration_escalates() {
   fire.humidityPct = 20.0f;        // drop of 35 -> +1
   Result r = feed(d, fire, 3, now);
   CHECK(r.severity == Severity::CRITICAL);
-  CHECK(r.score == 4);
+  CHECK(r.score == 5);  // elevated 1 + high 2 + gas 1 + humidity 1
   CHECK(r.newEvent);
   // Escalation of an open event notifies again but is not a new event.
   fire.pm25 = 200.0f;
@@ -89,6 +91,31 @@ static void test_corroboration_escalates() {
   // Baseline must not have chased the event.
   CHECK(r.baselineGasKOhm > 110.0f);
   CHECK(r.baselineHumidityPct > 50.0f);
+}
+
+static void test_elevated_pm25_is_watch_until_corroborated() {
+  std::printf("pm2.5 between 35 and 55 is a watch, and an alert with a second signal\n");
+  Detector d;
+  uint32_t now = 0;
+  feed(d, clean(), 50, now);
+  Sample haze = clean();
+  haze.pm25 = 42.0f;
+  Result r = feed(d, haze, 3, now);
+  CHECK(r.severity == Severity::WATCH);
+  CHECK(r.signals == SIG_PM25_ELEVATED);
+  CHECK(!r.notify);                       // no note for distant regional smoke
+  r = feed(d, haze, 20, now);
+  CHECK(r.severity == Severity::WATCH);   // stays a watch however long it lasts
+  // Same haze plus a gas resistance drop is two weak signals: alert.
+  Sample nearer = haze;
+  nearer.gasResistanceKOhm = 45.0f;
+  r = feed(d, nearer, 3, now);
+  CHECK(r.severity == Severity::ALERT);
+  CHECK(r.score == 2);
+  CHECK(r.notify);
+  // Back below 35 * 0.8 = 28 clears the watch.
+  r = feed(d, clean(), 3, now);
+  CHECK(r.severity == Severity::NONE);
 }
 
 static void test_single_weak_signal_is_watch() {
@@ -218,6 +245,7 @@ int main() {
   test_clean_air_stays_quiet();
   test_pm25_alert_needs_confirmation();
   test_corroboration_escalates();
+  test_elevated_pm25_is_watch_until_corroborated();
   test_single_weak_signal_is_watch();
   test_hysteresis_and_all_clear();
   test_periodic_reminder();

@@ -9,7 +9,7 @@ void Detector::reset() {
   samplesSeen_ = 0;
   baselineInit_ = false;
   bTemp_ = bHum_ = bGas_ = bPm25_ = 0;
-  gPmHigh_.reset(); gPmCrit_.reset(); gTempHigh_.reset();
+  gPmElev_.reset(); gPmHigh_.reset(); gPmCrit_.reset(); gTempHigh_.reset();
   gTempRise_.reset(); gHumDrop_.reset(); gGasDrop_.reset();
   obstructedCount_ = 0;
   failCount_ = 0;
@@ -58,6 +58,7 @@ void Detector::learn(const Sample& s) {
 
 uint8_t Detector::scoreFor(uint16_t sig) const {
   uint8_t score = 0;
+  if (sig & SIG_PM25_ELEVATED) score += 1;
   if (sig & SIG_PM25_HIGH)     score += 2;
   if (sig & SIG_PM25_CRITICAL) score += 2;  // stacks with PM25_HIGH: 4 total
   if (sig & SIG_TEMP_HIGH)     score += 2;
@@ -103,6 +104,9 @@ Result Detector::update(const Sample& s, uint32_t nowMs) {
 
   // --- Absolute limits (valid from the very first sample) ------------------
   const bool pmUsable = s.pmValid && !s.pmObstructed;
+  if (gPmElev_.feed(pmUsable && s.pm25 >= cfg_.pm25WatchUgm3,
+                    !pmUsable || s.pm25 < cfg_.pm25WatchUgm3 * cr, confirm))
+    sig |= SIG_PM25_ELEVATED;
   if (gPmHigh_.feed(pmUsable && s.pm25 >= cfg_.pm25AlertUgm3,
                     !pmUsable || s.pm25 < cfg_.pm25AlertUgm3 * cr, confirm))
     sig |= SIG_PM25_HIGH;
@@ -199,6 +203,7 @@ const char* Detector::severityName(Severity s) {
 
 const char* Detector::signalName(Signal s) {
   switch (s) {
+    case SIG_PM25_ELEVATED: return "pm25_elevated";
     case SIG_PM25_HIGH: return "pm25_high";
     case SIG_PM25_CRITICAL: return "pm25_critical";
     case SIG_TEMP_HIGH: return "temperature_high";
