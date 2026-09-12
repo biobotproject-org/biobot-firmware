@@ -11,7 +11,9 @@
 //   alert.qo   immediately when the anomaly detector raises, escalates,
 //              repeats or clears an event (synced right away)
 //
-// Per-node identity and secrets live in config.h (see config.example.h).
+// Per-node identity lives in config.h (see config.example.h). The node holds
+// no API credentials: the Notehub route adds the server's token when it
+// forwards each note.
 // The anomaly logic lives in anomaly.h / anomaly.cpp and has host-side tests
 // in test/test_anomaly.cpp.
 
@@ -168,8 +170,6 @@ static bool sendRegistration() {
   J* body = JCreateObject();
   if (!body) return false;
   JAddStringToObject(body, "request_type", "create_device");
-  JAddStringToObject(body, "url", API_DEVICES_URL);
-  JAddStringToObject(body, "auth_token", API_AUTH_TOKEN);
   JAddStringToObject(body, "deviceId", DEVICE_ID);
   JAddStringToObject(body, "name", DEVICE_NAME);
   JAddStringToObject(body, "type", DEVICE_TYPE);
@@ -221,8 +221,6 @@ static bool sendAlert(const Reading& r, const biobot::Result& res, const char* e
   J* body = JCreateObject();
   if (!body) return false;
   JAddStringToObject(body, "request_type", "anomaly");
-  JAddStringToObject(body, "url", API_ALERTS_URL);
-  JAddStringToObject(body, "auth_token", API_AUTH_TOKEN);
   JAddStringToObject(body, "deviceId", DEVICE_ID);
   JAddStringToObject(body, "event", event);
   JAddStringToObject(body, "severity", biobot::Detector::severityName(res.severity));

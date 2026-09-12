@@ -1,0 +1,35 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  detector-tests:
+    name: Detector host tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and run
+        working-directory: Firmware/Notecard
+        run: |
+          g++ -std=c++17 -Wall -Wextra -Werror -I. anomaly.cpp test/test_anomaly.cpp -o test_anomaly
+          ./test_anomaly
+
+  compile-sketch:
+    name: Compile for Arduino Nano ESP32
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install arduino-cli
+        uses: arduino/setup-arduino-cli@v2
+      - name: Install core and libraries
+        run: |
+          arduino-cli core update-index
+          arduino-cli core install arduino:esp32
+          arduino-cli lib install "Adafruit BME680 Library" "Adafruit Unified Sensor" "SparkFun BMV080 Arduino Library" "Blues Wireless Notecard"
+      - name: Provide a config.h for the build
+        run: cp Firmware/Notecard/config.example.h Firmware/Notecard/config.h
+      - name: Compile
+        run: arduino-cli compile --fqbn arduino:esp32:nano_nora --warnings default Firmware/Notecard
