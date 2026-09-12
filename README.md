@@ -110,7 +110,7 @@ Firmware/Notecard/Notecard.ino      main sketch: sensors, buffering, Notecard I/
 Firmware/Notecard/anomaly.h / .cpp  portable anomaly detector
 Firmware/Notecard/config.example.h  template for per-node secrets and identity
 Firmware/Notecard/test/             host-side unit tests
-new.grc/                            earlier UART-based prototype, kept for reference
+archive/new.grc/                    earlier UART-based prototype, kept for reference
 ```
 
 ## Power note
