@@ -72,7 +72,7 @@ struct Reading {
   uint8_t anomalyScore;
 };
 
-static Adafruit_BME680 bme;
+static Adafruit_BME680 bme(&Wire);
 static SparkFunBMV080 bmv080;
 static Notecard notecard;
 static biobot::Detector detector;
@@ -264,9 +264,9 @@ static bool sendAlert(const Reading& r, const biobot::Result& res, const char* e
 // ---------------------------------------------------------------------------
 static bool bmeBegin() {
   uint8_t found = 0;
-  if (bme.begin(BME_ADDR_PRIMARY, &Wire)) {
+  if (bme.begin(BME_ADDR_PRIMARY)) {
     found = BME_ADDR_PRIMARY;
-  } else if (bme.begin(BME_ADDR_SECONDARY, &Wire)) {
+  } else if (bme.begin(BME_ADDR_SECONDARY)) {
     found = BME_ADDR_SECONDARY;
   }
   if (!found) {
