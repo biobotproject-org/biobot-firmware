@@ -78,22 +78,56 @@ periodic reminder), or `cleared`.
 
 ## Building
 
-1. Install the Arduino IDE or `arduino-cli` with an ESP32 board package.
-2. Install these libraries: Adafruit BME680, Adafruit Unified Sensor,
-   SparkFun BMV080, Blues Wireless Notecard.
-3. Copy `Firmware/Notecard/config.example.h` to `Firmware/Notecard/config.h`
+1. Install the Arduino IDE and, in Boards Manager, **Arduino ESP32 Boards**.
+   The target is **Arduino Nano ESP32** (`arduino:esp32:nano_nora`).
+2. In Library Manager install, by exact name: **Adafruit BME680 Library**,
+   **Adafruit Unified Sensor**, **SparkFun BMV080 Arduino Library** (accept
+   its SparkFun Toolkit dependency), and **Blues Wireless Notecard**.
+3. Install the Bosch BMV080 SDK into the SparkFun library. See the next
+   section; the build fails with `bmv080.h not found` until this is done.
+4. Copy `Firmware/Notecard/config.example.h` to `Firmware/Notecard/config.h`
    and fill in your Notehub product UID and device identity. `config.h` is
-   git-ignored. The node holds no API credentials; the Notehub route adds
-   the server's token when it forwards notes (see the biobot-cloud README).
-4. Open `Firmware/Notecard/Notecard.ino` and upload.
+   git-ignored.
+5. Open `Firmware/Notecard/Notecard.ino` and upload. Serial Monitor at
+   115200 baud shows every step of startup.
 
 Wiring defaults are at the top of the sketch: I2C on A4/A5 at 100 kHz.
 
-## Continuous integration
+## Bosch BMV080 SDK
 
-Every push and pull request compiles the sketch for the Arduino Nano ESP32
-with `arduino-cli` and runs the detector's host tests. See
-`.github/workflows/build.yml`.
+The SparkFun library is a thin wrapper around a precompiled library from
+Bosch, which Bosch licenses for use but not redistribution. So it is not
+in this repository, not in the SparkFun library, and not on the Arduino
+package servers. Every machine that builds the firmware needs it once:
+
+1. Download the SDK from Bosch's BMV080 page under Documents ("Download
+   the SDK for BMV080"). A Bosch account is required.
+2. Unzip it. Find your SparkFun library folder:
+   `Documents/Arduino/libraries/SparkFun_BMV080_Arduino_Library` on
+   Windows and macOS, `~/Arduino/libraries/...` on Linux.
+3. Copy `api/inc/bmv080.h` and `api/inc/bmv080_defs.h` into that
+   library's `src/sfTk/` folder.
+4. Copy the two `.a` files from
+   `api/api/lib/xtensa_esp32s3/xtensa_esp32s3_elf_gcc/release/` into the
+   library's `src/esp32s3/` folder. The Nano ESP32 is an ESP32-S3. The
+   SparkFun README lists the paths for every other architecture.
+
+**Continuous integration.** The compile job in `.github/workflows/build.yml`
+needs the same files. Put the unzipped SDK in a private GitHub repository
+that only the team can read, then add two repository secrets to
+biobot-firmware: `BMV080_SDK_REPO` (for example
+`biobotproject-org/bmv080-sdk`) and `BMV080_SDK_TOKEN` (a fine-grained
+personal access token with read access to that private repository).
+Until both exist the job skips with a notice rather than failing.
+
+## Bench power
+
+USB alone powers the Nano but not the Notecard: its modem supply comes
+from the board's 5 V rail, which the 12 V input feeds. On the bench,
+connect a 12 V supply of at least 2 A to the screw terminal as well as
+the USB cable. Check polarity before applying power; rev A of the board
+has no fuse. Attach the cellular antenna to the Notecard's main u.FL
+connector before the first boot.
 
 ## Testing the detector on your computer
 
