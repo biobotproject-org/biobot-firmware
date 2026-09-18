@@ -52,6 +52,12 @@ static const uint32_t STATUS_PRINT_INTERVAL_MS = 60UL * 1000UL;
 static const uint8_t BATCH_SIZE = DATA_SEND_INTERVAL_MS / SENSOR_READ_INTERVAL_MS;  // 20
 static const uint8_t BUFFER_CAPACITY = BATCH_SIZE + BATCH_SIZE / 2;                // 30
 
+// A BME680/688 that fails at boot or stops answering mid-run is retried
+// rather than written off: a brown-out during a cellular transmit, or a
+// connector nudged on the bench, should not cost the node every later sample.
+static const uint32_t BME_RETRY_INTERVAL_MS = 60UL * 1000UL;
+static const uint8_t BME_REINIT_AFTER_FAILURES = 3;
+
 static const uint8_t SETUP_WARMUP_READS = 5;   // gas heater warmup in setup()
 static const uint8_t LOOP_WARMUP_READS = 2;    // early loop samples not buffered
 
@@ -81,6 +87,9 @@ static Reading buffer[BUFFER_CAPACITY];
 static uint8_t bufferCount = 0;
 
 static bool bmeReady = false;
+static uint8_t bmeAddr = 0;         // address it answered on, 0 if never found
+static uint8_t bmeFailures = 0;     // consecutive failed reads
+static uint32_t lastBmeRetryMs = 0;
 static bool deviceRegistered = false;
 static uint32_t sampleCount = 0;
 static uint32_t droppedReadings = 0;
@@ -262,18 +271,50 @@ static bool sendAlert(const Reading& r, const biobot::Result& res, const char* e
 // ---------------------------------------------------------------------------
 // Sensors
 // ---------------------------------------------------------------------------
-static bool bmeBegin() {
+// Does anything answer at this address? Tells "the sensor fell off the bus"
+// apart from "the sensor is there but the reading failed" - two faults that
+// used to produce the same log line.
+static bool i2cPresent(uint8_t addr) {
+  Wire.beginTransmission(addr);
+  return Wire.endTransmission() == 0;
+}
+
+// Print every address that answers, so the boot log carries the same evidence
+// an I2C scanner sketch would give. Expect 0x17 (Notecard), 0x57 (BMV080) and
+// one of 0x76/0x77 (BME680/688).
+static void i2cScan() {
+  Serial.print("[SETUP] I2C scan:");
   uint8_t found = 0;
-  if (bme.begin(BME_ADDR_PRIMARY)) {
-    found = BME_ADDR_PRIMARY;
-  } else if (bme.begin(BME_ADDR_SECONDARY)) {
-    found = BME_ADDR_SECONDARY;
+  for (uint8_t addr = 1; addr < 127; addr++) {
+    if (i2cPresent(addr)) {
+      Serial.printf(" 0x%02X", addr);
+      found++;
+    }
   }
-  if (!found) {
-    Serial.println("[SETUP] BME680/688 not found - check wiring and address");
+  if (found == 0) Serial.print(" nothing answered");
+  Serial.printf("  (%u device%s)\n", found, found == 1 ? "" : "s");
+}
+
+// warmup runs the gas heater settling reads; skipped when re-initialising
+// mid-run so a recovery does not block the loop for ten seconds.
+static bool bmeBegin(bool warmup) {
+  bmeAddr = 0;
+  if (bme.begin(BME_ADDR_PRIMARY)) {
+    bmeAddr = BME_ADDR_PRIMARY;
+  } else if (bme.begin(BME_ADDR_SECONDARY)) {
+    bmeAddr = BME_ADDR_SECONDARY;
+  }
+  if (bmeAddr == 0) {
+    if (i2cPresent(BME_ADDR_PRIMARY) || i2cPresent(BME_ADDR_SECONDARY)) {
+      Serial.println("[BME] init failed even though 0x76/0x77 answers - the chip is on the "
+                     "bus but would not identify itself (bus noise or a dead sensor)");
+    } else {
+      Serial.println("[BME] not found - nothing answers at 0x76 or 0x77 (check wiring, 3V3 "
+                     "and that SDO is not floating against a noisy lead)");
+    }
     return false;
   }
-  Serial.printf("[SETUP] BME680/688 found at 0x%02X\n", found);
+  Serial.printf("[BME] found at 0x%02X\n", bmeAddr);
 
   bme.setTemperatureOversampling(BME680_OS_8X);
   bme.setHumidityOversampling(BME680_OS_2X);
@@ -281,17 +322,30 @@ static bool bmeBegin() {
   bme.setIIRFilterSize(BME680_FILTER_SIZE_3);
   bme.setGasHeater(320, 150);  // 320 °C for 150 ms
 
-  Serial.println("[SETUP] Warming up gas heater...");
-  for (uint8_t i = 0; i < SETUP_WARMUP_READS; i++) {
-    if (bme.performReading()) {
-      Serial.printf("[SETUP] Warmup %u/%u - gas %.1f kΩ\n", i + 1, SETUP_WARMUP_READS,
-                    bme.gas_resistance / 1000.0f);
-    } else {
-      Serial.printf("[SETUP] Warmup %u/%u - read failed\n", i + 1, SETUP_WARMUP_READS);
+  if (warmup) {
+    Serial.println("[BME] Warming up gas heater...");
+    for (uint8_t i = 0; i < SETUP_WARMUP_READS; i++) {
+      if (bme.performReading()) {
+        Serial.printf("[BME] Warmup %u/%u - gas %.1f kΩ\n", i + 1, SETUP_WARMUP_READS,
+                      bme.gas_resistance / 1000.0f);
+      } else {
+        Serial.printf("[BME] Warmup %u/%u - read failed\n", i + 1, SETUP_WARMUP_READS);
+      }
+      delay(2000);
     }
-    delay(2000);
   }
+  bmeFailures = 0;
   return true;
+}
+
+// Throttled re-init, used both when the sensor was missing at boot and when a
+// run of reads fails. Returns without doing anything until the interval is up.
+static void bmeRecover(const char* why) {
+  if ((uint32_t)(millis() - lastBmeRetryMs) < BME_RETRY_INTERVAL_MS) return;
+  lastBmeRetryMs = millis();
+  Serial.printf("[BME] re-initialising (%s)\n", why);
+  bmeReady = bmeBegin(false);
+  Serial.printf("[BME] re-init %s\n", bmeReady ? "succeeded" : "failed, will retry");
 }
 
 static bool bmv080Begin() {
@@ -309,10 +363,23 @@ static bool bmv080Begin() {
 static bool readSensors(Reading& r) {
   memset(&r, 0, sizeof(r));
 
-  if (!bmeReady || !bme.performReading()) {
-    Serial.println("[SENS] BME680/688 read failed");
+  // Another library sharing this bus (the Notecard) can leave the clock where
+  // it wants it; put it back before touching the sensors.
+  Wire.setClock(I2C_CLOCK_HZ);
+
+  if (!bmeReady) {
+    Serial.println("[SENS] BME680/688 unavailable - it never initialised");
+    bmeRecover("never initialised");
     return false;
   }
+  if (!bme.performReading()) {
+    if (bmeFailures < 255) bmeFailures++;
+    Serial.printf("[SENS] BME680/688 read failed (%u in a row) - 0x%02X %s\n", bmeFailures,
+                  bmeAddr, i2cPresent(bmeAddr) ? "still answers" : "has gone silent");
+    if (bmeFailures >= BME_REINIT_AFTER_FAILURES) bmeRecover("repeated read failures");
+    return false;
+  }
+  bmeFailures = 0;
   r.temperatureC = bme.temperature;
   r.humidityPct = bme.humidity;
   r.pressureHpa = bme.pressure / 100.0f;
@@ -422,10 +489,11 @@ static void taskStatus() {
   lastStatusMs = millis();
   uint32_t sinceSend = millis() - lastDataSendMs;
   uint32_t untilSend = sinceSend >= DATA_SEND_INTERVAL_MS ? 0 : DATA_SEND_INTERVAL_MS - sinceSend;
-  Serial.printf("\n[STATUS] up %lu s | heap %u | registered %s | buffer %u/%u | dropped %lu | "
-                "severity %s | next send in %lu s\n\n",
+  Serial.printf("\n[STATUS] up %lu s | heap %u | registered %s | bme %s | buffer %u/%u | "
+                "dropped %lu | severity %s | next send in %lu s\n\n",
                 (unsigned long)(millis() / 1000), (unsigned)ESP.getFreeHeap(),
-                deviceRegistered ? "yes" : "no", bufferCount, BUFFER_CAPACITY,
+                deviceRegistered ? "yes" : "no", bmeReady ? "ok" : "FAULT",
+                bufferCount, BUFFER_CAPACITY,
                 (unsigned long)droppedReadings,
                 biobot::Detector::severityName(detector.severity()),
                 (unsigned long)(untilSend / 1000));
@@ -452,9 +520,10 @@ void setup() {
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
   Wire.setClock(I2C_CLOCK_HZ);
   delay(100);
+  i2cScan();
 
   Serial.println("[SETUP] Init BME680/688...");
-  bmeReady = bmeBegin();
+  bmeReady = bmeBegin(true);
 
   Serial.println("[SETUP] Init BMV080...");
   if (!bmv080Begin()) {

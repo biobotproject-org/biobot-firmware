@@ -129,6 +129,33 @@ the USB cable. Check polarity before applying power; rev A of the board
 has no fuse. Attach the cellular antenna to the Notecard's main u.FL
 connector before the first boot.
 
+## Reading the boot log
+
+The sketch scans the I2C bus before it touches a sensor, so the first
+useful line of every boot lists what answered:
+
+```
+[SETUP] I2C scan: 0x17 0x57 0x77  (3 devices)
+```
+
+Expect `0x17` (Notecard), `0x57` (BMV080) and one of `0x76` / `0x77`
+(BME680/688). A missing address is a wiring, power or connector fault; an
+address that is present while the sensor still misbehaves is a firmware or
+sensor-configuration fault, and the log then says which:
+
+| Line | Meaning |
+| --- | --- |
+| `[BME] not found` | nothing answers at 0x76 or 0x77 — check the lead, 3V3 and SDO |
+| `[BME] init failed even though 0x76/0x77 answers` | the chip is on the bus but would not identify itself |
+| `[SENS] BME680/688 read failed (n in a row) - 0x77 still answers` | the bus is fine; the measurement itself failed |
+| `[SENS] BME680/688 read failed (n in a row) - 0x77 has gone silent` | the sensor dropped off mid-run, usually power |
+
+The node no longer gives up on a sensor that fails at boot. It re-runs the
+whole init at most once a minute, and after three consecutive failed reads,
+so a brown-out during a cellular transmit or a nudged connector costs a few
+samples instead of the rest of the run. The minute status line reports
+`bme ok` or `bme FAULT`.
+
 ## Testing the detector on your computer
 
 The anomaly logic has no Arduino dependencies, so it can be tested on a
