@@ -40,6 +40,7 @@ static const uint32_t I2C_CLOCK_HZ = 100000;          // slow and robust for lon
 static const uint8_t BME_ADDR_PRIMARY = 0x77;
 static const uint8_t BME_ADDR_SECONDARY = 0x76;
 static const uint8_t BMV080_ADDR = 0x57;
+static const uint8_t NOTECARD_ADDR = 0x17;
 
 static const uint32_t SENSOR_READ_INTERVAL_MS = 30UL * 1000UL;        // 30 s
 static const uint32_t DATA_SEND_INTERVAL_MS = 10UL * 60UL * 1000UL;   // 10 min
@@ -55,8 +56,14 @@ static const uint8_t BUFFER_CAPACITY = BATCH_SIZE + BATCH_SIZE / 2;             
 // A BME680/688 that fails at boot or stops answering mid-run is retried
 // rather than written off: a brown-out during a cellular transmit, or a
 // connector nudged on the bench, should not cost the node every later sample.
-static const uint32_t BME_RETRY_INTERVAL_MS = 60UL * 1000UL;
-static const uint8_t BME_REINIT_AFTER_FAILURES = 3;
+// Recovery is cheap, so it runs on the first failed read; the interval only
+// stops it looping tightly.
+static const uint32_t BME_RETRY_INTERVAL_MS = 10UL * 1000UL;
+
+// Wall-clock time comes from the Notecard over the shared I2C bus, so it is
+// anchored once and carried forward on millis() instead of being re-fetched
+// for every sample.
+static const uint32_t TIME_REFRESH_INTERVAL_MS = 60UL * 60UL * 1000UL;
 
 static const uint8_t SETUP_WARMUP_READS = 5;   // gas heater warmup in setup()
 static const uint8_t LOOP_WARMUP_READS = 2;    // early loop samples not buffered
@@ -90,6 +97,10 @@ static bool bmeReady = false;
 static uint8_t bmeAddr = 0;         // address it answered on, 0 if never found
 static uint8_t bmeFailures = 0;     // consecutive failed reads
 static uint32_t lastBmeRetryMs = 0;
+
+static bool timeValid = false;       // the Notecard has given us the time once
+static time_t timeBaseUnix = 0;      // its answer
+static uint32_t timeBaseMs = 0;      // millis() when that answer arrived
 static bool deviceRegistered = false;
 static uint32_t sampleCount = 0;
 static uint32_t droppedReadings = 0;
@@ -107,9 +118,10 @@ static float pressureToAltitudeM(float hPa, float seaLevelHpa = 1013.25f) {
   return 44330.0f * (1.0f - powf(hPa / seaLevelHpa, 0.1903f));
 }
 
-// Ask the Notecard for wall-clock time as ISO 8601 UTC. Returns false until
-// the Notecard has synced time with the network.
-static bool notecardTimeIso(char* out, size_t outSize) {
+// Ask the Notecard for UNIX time. Returns false until it has synced with the
+// network. This is I2C traffic on the bus the sensors sit on, so callers go
+// through timeRefresh() rather than calling it per sample.
+static bool notecardFetchUnix(time_t& out) {
   J* req = notecard.newRequest("card.time");
   if (!req) return false;
   J* rsp = notecard.requestAndResponse(req);
@@ -117,8 +129,27 @@ static bool notecardTimeIso(char* out, size_t outSize) {
   double unixTime = JGetNumber(rsp, "time");
   notecard.deleteResponse(rsp);
   if (unixTime <= 0) return false;
+  out = (time_t)unixTime;
+  return true;
+}
 
-  time_t raw = (time_t)unixTime;
+// Re-anchor the clock at most once an hour, and keep trying until the first
+// answer arrives. millis() is good to a few seconds an hour, which is well
+// inside what a 30 s sample interval needs.
+static void timeRefresh() {
+  if (timeValid && (uint32_t)(millis() - timeBaseMs) < TIME_REFRESH_INTERVAL_MS) return;
+  time_t fetched;
+  if (!notecardFetchUnix(fetched)) return;
+  timeBaseUnix = fetched;
+  timeBaseMs = millis();
+  if (!timeValid) Serial.println("[TIME] network time acquired");
+  timeValid = true;
+}
+
+// Current time as ISO 8601 UTC, from the cached anchor plus elapsed millis().
+static bool nowIso(char* out, size_t outSize) {
+  if (!timeValid) return false;
+  time_t raw = timeBaseUnix + (time_t)((uint32_t)(millis() - timeBaseMs) / 1000UL);
   struct tm* utc = gmtime(&raw);
   if (!utc) return false;
   strftime(out, outSize, "%Y-%m-%dT%H:%M:%SZ", utc);
@@ -271,12 +302,42 @@ static bool sendAlert(const Reading& r, const biobot::Result& res, const char* e
 // ---------------------------------------------------------------------------
 // Sensors
 // ---------------------------------------------------------------------------
-// Does anything answer at this address? Tells "the sensor fell off the bus"
-// apart from "the sensor is there but the reading failed" - two faults that
-// used to produce the same log line.
-static bool i2cPresent(uint8_t addr) {
+// Raw probe. 0 means the device acknowledged; anything else is the TwoWire
+// error, and which error it is decides the diagnosis:
+//   2 - address not acknowledged: the chip is unpowered, or gone
+//   3 - data not acknowledged
+//   5 - timeout: the bus itself is being held, so no address can answer
+static uint8_t i2cProbe(uint8_t addr) {
   Wire.beginTransmission(addr);
-  return Wire.endTransmission() == 0;
+  return Wire.endTransmission();
+}
+
+static bool i2cPresent(uint8_t addr) { return i2cProbe(addr) == 0; }
+
+// Tear the I2C controller down and bring it back up. A transaction that times
+// out can leave the peripheral wedged so every later transfer fails, which
+// looks exactly like a sensor that vanished.
+static void i2cBusReset() {
+  Wire.end();
+  delay(10);
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  Wire.setClock(I2C_CLOCK_HZ);
+  delay(10);
+}
+
+// Probe all three known devices and say what the bus looks like. If the BME is
+// silent while the Notecard still answers, the sensor lost power or died; if
+// nothing answers, the bus is stuck and worth resetting.
+static void i2cDiagnose() {
+  uint8_t bmeErr = i2cProbe(bmeAddr != 0 ? bmeAddr : BME_ADDR_SECONDARY);
+  uint8_t noteErr = i2cProbe(NOTECARD_ADDR);
+  uint8_t pmErr = i2cProbe(BMV080_ADDR);
+  Serial.printf("[I2C] probe errors - bme %u | notecard %u | bmv080 %u\n", bmeErr, noteErr,
+                pmErr);
+  if (bmeErr != 0 && noteErr != 0 && pmErr != 0) {
+    Serial.println("[I2C] nothing on the bus answers - resetting the controller");
+    i2cBusReset();
+  }
 }
 
 // Print every address that answers, so the boot log carries the same evidence
@@ -299,19 +360,23 @@ static void i2cScan() {
 // mid-run so a recovery does not block the loop for ten seconds.
 static bool bmeBegin(bool warmup) {
   bmeAddr = 0;
-  if (bme.begin(BME_ADDR_PRIMARY)) {
-    bmeAddr = BME_ADDR_PRIMARY;
-  } else if (bme.begin(BME_ADDR_SECONDARY)) {
-    bmeAddr = BME_ADDR_SECONDARY;
+  // 0x76 first: that is where a BME688 sits with SDO low, which is what rev A
+  // of the board leaves it at. Probe before calling begin(), because begin()
+  // against an absent address is a guaranteed failed transaction on a bus we
+  // already suspect.
+  const uint8_t candidates[] = {BME_ADDR_SECONDARY, BME_ADDR_PRIMARY};
+  for (uint8_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]) && bmeAddr == 0; i++) {
+    uint8_t err = i2cProbe(candidates[i]);
+    if (err != 0) {
+      Serial.printf("[BME] 0x%02X no answer (I2C error %u)\n", candidates[i], err);
+    } else if (bme.begin(candidates[i])) {
+      bmeAddr = candidates[i];
+    } else {
+      Serial.printf("[BME] 0x%02X answers but would not identify itself\n", candidates[i]);
+    }
   }
   if (bmeAddr == 0) {
-    if (i2cPresent(BME_ADDR_PRIMARY) || i2cPresent(BME_ADDR_SECONDARY)) {
-      Serial.println("[BME] init failed even though 0x76/0x77 answers - the chip is on the "
-                     "bus but would not identify itself (bus noise or a dead sensor)");
-    } else {
-      Serial.println("[BME] not found - nothing answers at 0x76 or 0x77 (check wiring, 3V3 "
-                     "and that SDO is not floating against a noisy lead)");
-    }
+    Serial.println("[BME] unavailable - see the probe errors above");
     return false;
   }
   Serial.printf("[BME] found at 0x%02X\n", bmeAddr);
@@ -338,14 +403,16 @@ static bool bmeBegin(bool warmup) {
   return true;
 }
 
-// Throttled re-init, used both when the sensor was missing at boot and when a
-// run of reads fails. Returns without doing anything until the interval is up.
+// Throttled recovery, used both when the sensor was missing at boot and when a
+// read fails. Diagnoses the bus first, since a wedged controller has to be
+// reset before re-initialising the sensor can possibly work.
 static void bmeRecover(const char* why) {
   if ((uint32_t)(millis() - lastBmeRetryMs) < BME_RETRY_INTERVAL_MS) return;
   lastBmeRetryMs = millis();
-  Serial.printf("[BME] re-initialising (%s)\n", why);
+  Serial.printf("[BME] recovering (%s)\n", why);
+  i2cDiagnose();
   bmeReady = bmeBegin(false);
-  Serial.printf("[BME] re-init %s\n", bmeReady ? "succeeded" : "failed, will retry");
+  Serial.printf("[BME] recovery %s\n", bmeReady ? "succeeded" : "failed, will retry");
 }
 
 static bool bmv080Begin() {
@@ -374,9 +441,10 @@ static bool readSensors(Reading& r) {
   }
   if (!bme.performReading()) {
     if (bmeFailures < 255) bmeFailures++;
-    Serial.printf("[SENS] BME680/688 read failed (%u in a row) - 0x%02X %s\n", bmeFailures,
-                  bmeAddr, i2cPresent(bmeAddr) ? "still answers" : "has gone silent");
-    if (bmeFailures >= BME_REINIT_AFTER_FAILURES) bmeRecover("repeated read failures");
+    uint8_t err = i2cProbe(bmeAddr);
+    Serial.printf("[SENS] BME680/688 read failed (%u in a row) - 0x%02X %s (I2C error %u)\n",
+                  bmeFailures, bmeAddr, err == 0 ? "still answers" : "silent", err);
+    bmeRecover("read failed");
     return false;
   }
   bmeFailures = 0;
@@ -419,7 +487,8 @@ static void taskSample() {
 
   Reading r;
   if (!readSensors(r)) return;
-  bool hasTime = notecardTimeIso(r.timestampIso, sizeof(r.timestampIso));
+  timeRefresh();
+  bool hasTime = nowIso(r.timestampIso, sizeof(r.timestampIso));
 
   // Detection runs on every sample, even before the clock or buffer are ready.
   biobot::Sample s;

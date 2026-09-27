@@ -135,26 +135,45 @@ The sketch scans the I2C bus before it touches a sensor, so the first
 useful line of every boot lists what answered:
 
 ```
-[SETUP] I2C scan: 0x17 0x57 0x77  (3 devices)
+[SETUP] I2C scan: 0x17 0x57 0x76  (3 devices)
 ```
 
 Expect `0x17` (Notecard), `0x57` (BMV080) and one of `0x76` / `0x77`
-(BME680/688). A missing address is a wiring, power or connector fault; an
-address that is present while the sensor still misbehaves is a firmware or
-sensor-configuration fault, and the log then says which:
+(BME680/688 — rev A leaves SDO low, so 0x76). When a read fails, the log
+carries the raw TwoWire error code, which is what actually distinguishes
+the possible faults:
 
-| Line | Meaning |
+| Error | Meaning |
 | --- | --- |
-| `[BME] not found` | nothing answers at 0x76 or 0x77 — check the lead, 3V3 and SDO |
-| `[BME] init failed even though 0x76/0x77 answers` | the chip is on the bus but would not identify itself |
-| `[SENS] BME680/688 read failed (n in a row) - 0x77 still answers` | the bus is fine; the measurement itself failed |
-| `[SENS] BME680/688 read failed (n in a row) - 0x77 has gone silent` | the sensor dropped off mid-run, usually power |
+| 0 | the chip acknowledged: the bus is fine and the measurement itself failed |
+| 2 | address not acknowledged: that chip is unpowered or gone |
+| 5 | timeout: the bus is being held, so no address can answer |
 
-The node no longer gives up on a sensor that fails at boot. It re-runs the
-whole init at most once a minute, and after three consecutive failed reads,
-so a brown-out during a cellular transmit or a nudged connector costs a few
-samples instead of the rest of the run. The minute status line reports
-`bme ok` or `bme FAULT`.
+A failed read triggers a recovery pass, which probes all three devices
+before doing anything:
+
+```
+[SENS] BME680/688 read failed (1 in a row) - 0x76 silent (I2C error 5)
+[BME] recovering (read failed)
+[I2C] probe errors - bme 5 | notecard 5 | bmv080 5
+[I2C] nothing on the bus answers - resetting the controller
+[BME] found at 0x76
+[BME] recovery succeeded
+```
+
+If all three errors are non-zero the bus itself is wedged, and the
+controller is torn down and restarted. If only the BME is non-zero while
+the Notecard still answers, the bus is healthy and the sensor has lost
+power or died — a wiring, connector or supply problem, not a firmware one.
+
+Recovery runs on the first failed read, at most once every 10 seconds, so
+a brown-out during a cellular transmit or a nudged connector costs a
+sample or two instead of the rest of the run. The minute status line
+reports `bme ok` or `bme FAULT`.
+
+Network time is fetched from the Notecard once and carried forward on
+`millis()`, re-anchored hourly, rather than fetched for every sample. That
+keeps 20 of every 21 Notecard transactions off the bus the sensors share.
 
 ## Testing the detector on your computer
 
