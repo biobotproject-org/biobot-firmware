@@ -140,36 +140,56 @@ useful line of every boot lists what answered:
 
 Expect `0x17` (Notecard), `0x57` (BMV080) and one of `0x76` / `0x77`
 (BME680/688 — rev A leaves SDO low, so 0x76). When a read fails, the log
-carries the raw TwoWire error code, which is what actually distinguishes
-the possible faults:
+carries the raw TwoWire error code:
 
 | Error | Meaning |
 | --- | --- |
 | 0 | the chip acknowledged: the bus is fine and the measurement itself failed |
-| 2 | address not acknowledged: that chip is unpowered or gone |
+| 2 | address not acknowledged: that chip is unpowered, in reset, or gone |
 | 5 | timeout: the bus is being held, so no address can answer |
 
 A failed read triggers a recovery pass, which probes all three devices
-before doing anything:
+first. If every probe is non-zero the bus is wedged and the controller is
+torn down and restarted. If only the BME is non-zero while the Notecard
+answers, the bus is healthy and the sensor itself dropped out.
+
+### When init succeeds but every reading fails
+
+This is the interesting case, and it points at one thing. `begin()` only
+soft-resets the chip and reads its calibration, which costs almost no
+current. A reading additionally fires the gas heater — 320 °C for 150 ms —
+and that is the only part of the cycle that draws real current. So a
+sensor that initialises perfectly and then fails every single reading,
+NACKing for a moment afterwards and answering again straight after, is a
+sensor whose supply cannot hold up under the heater. Its own brown-out
+detector puts it briefly into reset; that is the NACK.
+
+The node handles this itself. If no warmup read succeeds at boot, or three
+readings in a row fail, it disables the heater and says so:
 
 ```
-[SENS] BME680/688 read failed (1 in a row) - 0x76 silent (I2C error 5)
-[BME] recovering (read failed)
-[I2C] probe errors - bme 5 | notecard 5 | bmv080 5
-[I2C] nothing on the bus answers - resetting the controller
-[BME] found at 0x76
-[BME] recovery succeeded
+[BME] reads keep failing with the gas heater on - disabling the heater
+[BME] if readings now succeed, the heater current is browning the sensor out:
+      shorten its lead, decouple its 3V3, or give it its own supply
 ```
 
-If all three errors are non-zero the bus itself is wedged, and the
-controller is torn down and restarted. If only the BME is non-zero while
-the Notecard still answers, the bus is healthy and the sensor has lost
-power or died — a wiring, connector or supply problem, not a firmware one.
+Readings then resume without gas resistance, and the status line reads
+`bme ok, no gas`. The heater is re-tried once an hour in case the cause was
+temporary. If readings work with the heater off, the diagnosis is confirmed
+and the fix is electrical, not firmware: a shorter lead to the sensor, a
+10 µF bulk plus 100 nF ceramic across its 3V3 and GND at the sensor end,
+or a supply that is not shared with the Notecard's modem.
 
-Recovery runs on the first failed read, at most once every 10 seconds, so
-a brown-out during a cellular transmit or a nudged connector costs a
-sample or two instead of the rest of the run. The minute status line
-reports `bme ok` or `bme FAULT`.
+### Degraded operation
+
+The two sensors are read independently, so one failing does not silence
+the other. PM2.5 is the primary wildfire signal and keeps flowing with a
+dead BME; temperature, humidity and pressure keep flowing with the heater
+off. Channels that did not read are **omitted** from the note rather than
+sent as zero, and the detector treats an absent channel as absent — it
+raises no signal and does not move its baseline. A humidity reading of
+zero from a failed sensor would otherwise look like a 55-point humidity
+drop and trip a false alert; there is a host test covering exactly that.
 
 Network time is fetched from the Notecard once and carried forward on
 `millis()`, re-anchored hourly, rather than fetched for every sample. That
@@ -188,7 +208,8 @@ g++ -std=c++17 -Wall -Wextra -I. anomaly.cpp test/test_anomaly.cpp -o test/test_
 
 The tests cover clean air, debounced smoke alerts, multi-signal escalation,
 hysteresis, the all-clear, periodic reminders, baseline-relative temperature
-rise, and sensor faults.
+rise, sensor faults, and degraded operation with a failed BME or a disabled
+gas heater.
 
 ## Repository layout
 

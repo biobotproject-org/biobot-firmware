@@ -60,6 +60,15 @@ static const uint8_t BUFFER_CAPACITY = BATCH_SIZE + BATCH_SIZE / 2;             
 // stops it looping tightly.
 static const uint32_t BME_RETRY_INTERVAL_MS = 10UL * 1000UL;
 
+// The gas heater is the only part of a reading that draws real current, so it
+// is what fails first on a sensor whose supply cannot hold up - and it is the
+// only channel the node can afford to give up. Temperature, humidity, pressure
+// and PM2.5 all keep working without it.
+static const uint16_t BME_HEATER_C = 320;
+static const uint16_t BME_HEATER_MS = 150;
+static const uint8_t BME_HEATER_OFF_AFTER_FAILURES = 3;
+static const uint32_t BME_HEATER_RETRY_INTERVAL_MS = 60UL * 60UL * 1000UL;
+
 // Wall-clock time comes from the Notecard over the shared I2C bus, so it is
 // anchored once and carried forward on millis() instead of being re-fetched
 // for every sample.
@@ -78,6 +87,8 @@ struct Reading {
   float gasKOhm;
   float altitudeM;
   float pm1, pm25, pm10;
+  bool envValid;   // temperature, humidity, pressure, altitude usable
+  bool gasValid;   // gas resistance usable
   bool pmValid;
   bool pmObstructed;
   char timestampIso[24];  // "YYYY-MM-DDTHH:MM:SSZ"
@@ -97,6 +108,8 @@ static bool bmeReady = false;
 static uint8_t bmeAddr = 0;         // address it answered on, 0 if never found
 static uint8_t bmeFailures = 0;     // consecutive failed reads
 static uint32_t lastBmeRetryMs = 0;
+static bool bmeHeaterOn = true;
+static uint32_t lastHeaterRetryMs = 0;
 
 static bool timeValid = false;       // the Notecard has given us the time once
 static time_t timeBaseUnix = 0;      // its answer
@@ -233,12 +246,16 @@ static bool sendBatch(const Reading* readings, uint8_t count) {
     if (!item) continue;
     JAddStringToObject(item, "deviceId", DEVICE_ID);
 
+    // Only channels that actually read are sent: a missing channel is better
+    // than a zero the dashboard would plot as a real measurement.
     J* arr = JAddArrayToObject(item, "readings");
-    addReading(arr, "temperature", "°C", r.temperatureC, r.timestampIso);
-    addReading(arr, "humidity", "%", r.humidityPct, r.timestampIso);
-    addReading(arr, "pressure", "hPa", r.pressureHpa, r.timestampIso);
-    addReading(arr, "gasResistance", "kΩ", r.gasKOhm, r.timestampIso);
-    addReading(arr, "altitude", "m", r.altitudeM, r.timestampIso);
+    if (r.envValid) {
+      addReading(arr, "temperature", "°C", r.temperatureC, r.timestampIso);
+      addReading(arr, "humidity", "%", r.humidityPct, r.timestampIso);
+      addReading(arr, "pressure", "hPa", r.pressureHpa, r.timestampIso);
+      addReading(arr, "altitude", "m", r.altitudeM, r.timestampIso);
+    }
+    if (r.gasValid) addReading(arr, "gasResistance", "kΩ", r.gasKOhm, r.timestampIso);
     if (r.pmValid) {
       addReading(arr, "pm1", "μg/m³", r.pm1, r.timestampIso);
       addReading(arr, "pm25", "μg/m³", r.pm25, r.timestampIso);
@@ -385,18 +402,33 @@ static bool bmeBegin(bool warmup) {
   bme.setHumidityOversampling(BME680_OS_2X);
   bme.setPressureOversampling(BME680_OS_4X);
   bme.setIIRFilterSize(BME680_FILTER_SIZE_3);
-  bme.setGasHeater(320, 150);  // 320 °C for 150 ms
+  if (bmeHeaterOn) {
+    bme.setGasHeater(BME_HEATER_C, BME_HEATER_MS);
+  } else {
+    bme.setGasHeater(0, 0);  // disabled: see the heater fallback below
+  }
+  Serial.printf("[BME] gas heater %s\n", bmeHeaterOn ? "on" : "off (running without gas)");
 
   if (warmup) {
-    Serial.println("[BME] Warming up gas heater...");
+    Serial.println("[BME] Settling...");
+    uint8_t ok = 0;
     for (uint8_t i = 0; i < SETUP_WARMUP_READS; i++) {
       if (bme.performReading()) {
+        ok++;
         Serial.printf("[BME] Warmup %u/%u - gas %.1f kΩ\n", i + 1, SETUP_WARMUP_READS,
                       bme.gas_resistance / 1000.0f);
       } else {
         Serial.printf("[BME] Warmup %u/%u - read failed\n", i + 1, SETUP_WARMUP_READS);
       }
       delay(2000);
+    }
+    // Init succeeded but no reading did: the difference between the two is the
+    // heater, so drop it now rather than spend the first two minutes failing.
+    if (ok == 0 && bmeHeaterOn) {
+      Serial.println("[BME] no warmup read succeeded with the gas heater on - disabling it");
+      bmeHeaterOn = false;
+      bme.setGasHeater(0, 0);
+      lastHeaterRetryMs = millis();
     }
   }
   bmeFailures = 0;
@@ -415,6 +447,18 @@ static void bmeRecover(const char* why) {
   Serial.printf("[BME] recovery %s\n", bmeReady ? "succeeded" : "failed, will retry");
 }
 
+// Try the heater again occasionally: whatever starved it may be temporary, and
+// gas resistance is a real detection signal worth getting back.
+static void bmeHeaterRetry() {
+  if (bmeHeaterOn || !bmeReady) return;
+  if ((uint32_t)(millis() - lastHeaterRetryMs) < BME_HEATER_RETRY_INTERVAL_MS) return;
+  lastHeaterRetryMs = millis();
+  Serial.println("[BME] re-enabling the gas heater to see whether it holds up now");
+  bmeHeaterOn = true;
+  lastBmeRetryMs = millis() - BME_RETRY_INTERVAL_MS;  // let recovery run at once
+  bmeRecover("heater re-enabled");
+}
+
 static bool bmv080Begin() {
   if (!bmv080.begin(BMV080_ADDR, Wire)) {
     Serial.println("[SETUP] BMV080 not found - check wiring");
@@ -426,7 +470,10 @@ static bool bmv080Begin() {
   return true;
 }
 
-// Fill r from the sensors. Returns false if the BME680 could not be read.
+// Fill r from the sensors. The two sensors are read independently, so losing
+// one does not cost the other: PM2.5 is the primary wildfire signal and must
+// keep flowing even with a dead BME. Returns false only when neither sensor
+// produced anything, so there is nothing worth recording.
 static bool readSensors(Reading& r) {
   memset(&r, 0, sizeof(r));
 
@@ -435,26 +482,37 @@ static bool readSensors(Reading& r) {
   Wire.setClock(I2C_CLOCK_HZ);
 
   if (!bmeReady) {
-    Serial.println("[SENS] BME680/688 unavailable - it never initialised");
     bmeRecover("never initialised");
-    return false;
-  }
-  if (!bme.performReading()) {
+  } else if (bme.performReading()) {
+    bmeFailures = 0;
+    r.envValid = true;
+    r.temperatureC = bme.temperature;
+    r.humidityPct = bme.humidity;
+    r.pressureHpa = bme.pressure / 100.0f;
+    r.altitudeM = pressureToAltitudeM(r.pressureHpa);
+    // The library zeroes gas_resistance when the heater did not reach a stable
+    // temperature, so a zero here means "no gas reading", not "no resistance".
+    r.gasKOhm = bme.gas_resistance / 1000.0f;
+    r.gasValid = bmeHeaterOn && r.gasKOhm > 0.0f;
+    if (r.gasValid && (r.gasKOhm < 1.0f || r.gasKOhm > 500.0f)) {
+      Serial.printf("[SENS] WARNING: gas resistance %.1f kΩ out of expected range\n", r.gasKOhm);
+    }
+  } else {
     if (bmeFailures < 255) bmeFailures++;
     uint8_t err = i2cProbe(bmeAddr);
     Serial.printf("[SENS] BME680/688 read failed (%u in a row) - 0x%02X %s (I2C error %u)\n",
                   bmeFailures, bmeAddr, err == 0 ? "still answers" : "silent", err);
+    // Init keeps succeeding while readings keep failing, and the difference
+    // between the two is the heater. Give the heater up rather than the sensor.
+    if (bmeHeaterOn && bmeFailures >= BME_HEATER_OFF_AFTER_FAILURES) {
+      Serial.println("[BME] reads keep failing with the gas heater on - disabling the heater");
+      Serial.println("[BME] if readings now succeed, the heater current is browning the sensor "
+                     "out: shorten its lead, decouple its 3V3, or give it its own supply");
+      bmeHeaterOn = false;
+      lastHeaterRetryMs = millis();
+      lastBmeRetryMs = millis() - BME_RETRY_INTERVAL_MS;  // re-init straight away
+    }
     bmeRecover("read failed");
-    return false;
-  }
-  bmeFailures = 0;
-  r.temperatureC = bme.temperature;
-  r.humidityPct = bme.humidity;
-  r.pressureHpa = bme.pressure / 100.0f;
-  r.gasKOhm = bme.gas_resistance / 1000.0f;
-  r.altitudeM = pressureToAltitudeM(r.pressureHpa);
-  if (r.gasKOhm < 1.0f || r.gasKOhm > 500.0f) {
-    Serial.printf("[SENS] WARNING: gas resistance %.1f kΩ out of expected range\n", r.gasKOhm);
   }
 
   r.pmValid = bmv080.readSensor();
@@ -466,7 +524,7 @@ static bool readSensors(Reading& r) {
   } else {
     Serial.println("[SENS] BMV080 read failed");
   }
-  return true;
+  return r.envValid || r.pmValid;
 }
 
 // ---------------------------------------------------------------------------
@@ -498,14 +556,24 @@ static void taskSample() {
   s.pm25 = r.pm25;
   s.pmValid = r.pmValid;
   s.pmObstructed = r.pmObstructed;
+  s.envValid = r.envValid;
+  s.gasValid = r.gasValid;
   biobot::Result res = detector.update(s, millis());
   r.severity = res.severity;
   r.anomalyScore = res.score;
   sampleCount++;
 
-  Serial.printf("[SENS] T:%.1f°C H:%.1f%% P:%.1fhPa Gas:%.1fkΩ PM2.5:%.1f %s | %s score:%u%s\n",
-                r.temperatureC, r.humidityPct, r.pressureHpa, r.gasKOhm, r.pm25,
-                hasTime ? r.timestampIso : "(no time yet)",
+  Serial.print("[SENS] ");
+  if (r.envValid) {
+    Serial.printf("T:%.1f°C H:%.1f%% P:%.1fhPa ", r.temperatureC, r.humidityPct, r.pressureHpa);
+    if (r.gasValid) Serial.printf("Gas:%.1fkΩ ", r.gasKOhm);
+    else Serial.print("Gas:n/a ");
+  } else {
+    Serial.print("BME:fault ");
+  }
+  if (r.pmValid) Serial.printf("PM2.5:%.1f ", r.pm25);
+  else Serial.print("PM2.5:n/a ");
+  Serial.printf("%s | %s score:%u%s\n", hasTime ? r.timestampIso : "(no time yet)",
                 biobot::Detector::severityName(res.severity), res.score,
                 res.baselineReady ? "" : " [baseline learning]");
 
@@ -561,7 +629,8 @@ static void taskStatus() {
   Serial.printf("\n[STATUS] up %lu s | heap %u | registered %s | bme %s | buffer %u/%u | "
                 "dropped %lu | severity %s | next send in %lu s\n\n",
                 (unsigned long)(millis() / 1000), (unsigned)ESP.getFreeHeap(),
-                deviceRegistered ? "yes" : "no", bmeReady ? "ok" : "FAULT",
+                deviceRegistered ? "yes" : "no",
+                bmeReady ? (bmeHeaterOn ? "ok" : "ok, no gas") : "FAULT",
                 bufferCount, BUFFER_CAPACITY,
                 (unsigned long)droppedReadings,
                 biobot::Detector::severityName(detector.severity()),
@@ -612,6 +681,7 @@ void setup() {
 
 void loop() {
   taskRegister();
+  bmeHeaterRetry();
   taskSample();
   taskSend();
   taskStatus();

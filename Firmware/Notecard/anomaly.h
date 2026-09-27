@@ -31,12 +31,17 @@ namespace biobot {
 
 // A single reading from the environmental and particulate sensors.
 struct Sample {
-  float temperatureC;
-  float humidityPct;
-  float gasResistanceKOhm;  // BME680 gas resistance; drops when VOCs/smoke present
-  float pm25;               // ug/m3
-  bool pmValid;             // false when the BMV080 read failed
-  bool pmObstructed;        // BMV080 optical path blocked
+  float temperatureC = 0.0f;
+  float humidityPct = 0.0f;
+  float gasResistanceKOhm = 0.0f;  // BME680 gas resistance; drops when VOCs/smoke present
+  float pm25 = 0.0f;               // ug/m3
+  bool pmValid = false;            // false when the BMV080 read failed
+  bool pmObstructed = false;       // BMV080 optical path blocked
+  // A node with one dead sensor keeps reporting the others, so each group of
+  // channels carries its own validity. An invalid channel raises no signal and
+  // does not move its baseline - it is absent, not zero.
+  bool envValid = true;            // temperature, humidity, pressure usable
+  bool gasValid = true;            // gas resistance usable (heater on and stable)
 };
 
 // Bit flags describing which signals are currently confirmed.

@@ -241,6 +241,65 @@ static void test_signal_iteration() {
   CHECK(Detector::severityName(Severity::CRITICAL)[0] == 'c');
 }
 
+static void test_failed_bme_read_raises_nothing() {
+  std::printf("a failed BME read raises no environmental signal\n");
+  Detector d;
+  uint32_t now = 0;
+  Result r = feed(d, clean(), 60, now);
+  CHECK(r.baselineReady);
+  const float baseHum = r.baselineHumidityPct;
+
+  // What readSensors() hands over when the BME fails: zeroes, envValid false,
+  // and PM2.5 still good. Humidity 0 against a baseline of 55 would look like a
+  // 55-point drop, which is exactly the false alert this must not produce.
+  Sample bad = clean();
+  bad.envValid = false;
+  bad.gasValid = false;
+  bad.temperatureC = 0.0f;
+  bad.humidityPct = 0.0f;
+  bad.gasResistanceKOhm = 0.0f;
+  r = feed(d, bad, 20, now);
+  CHECK(r.severity == Severity::NONE);
+  CHECK((r.signals & SIG_HUMIDITY_DROP) == 0);
+  CHECK((r.signals & SIG_TEMP_RISE) == 0);
+  CHECK((r.signals & SIG_TEMP_HIGH) == 0);
+  CHECK((r.signals & SIG_GAS_DROP) == 0);
+  CHECK(!r.notify);
+  // The baselines must survive the outage rather than be dragged to zero.
+  CHECK(r.baselineHumidityPct > baseHum - 0.5f);
+  CHECK(r.baselineGasKOhm > 100.0f);
+
+  // PM2.5 still works while the BME is down, so smoke is still caught.
+  Sample smoke = bad;
+  smoke.pm25 = 200.0f;
+  r = feed(d, smoke, 4, now);
+  CHECK(r.severity == Severity::CRITICAL);
+}
+
+static void test_gas_ignored_while_heater_off() {
+  std::printf("gas is ignored, not zeroed, while the heater is off\n");
+  Detector d;
+  uint32_t now = 0;
+  Result r = feed(d, clean(), 60, now);
+  const float baseGas = r.baselineGasKOhm;
+
+  // Heater off: the library reports 0 kOhm, which is "no reading", not a
+  // collapse in resistance.
+  Sample noGas = clean();
+  noGas.gasValid = false;
+  noGas.gasResistanceKOhm = 0.0f;
+  r = feed(d, noGas, 30, now);
+  CHECK(r.severity == Severity::NONE);
+  CHECK((r.signals & SIG_GAS_DROP) == 0);
+  CHECK(r.baselineGasKOhm > baseGas - 0.5f);
+
+  // Heater back on at a genuinely low resistance: the signal still works.
+  Sample smokey = clean();
+  smokey.gasResistanceKOhm = 30.0f;  // a quarter of the 120 kOhm baseline
+  r = feed(d, smokey, 4, now);
+  CHECK((r.signals & SIG_GAS_DROP) != 0);
+}
+
 int main() {
   test_clean_air_stays_quiet();
   test_pm25_alert_needs_confirmation();
@@ -252,6 +311,8 @@ int main() {
   test_temperature_rise_relative_to_baseline();
   test_sensor_faults();
   test_signal_iteration();
+  test_failed_bme_read_raises_nothing();
+  test_gas_ignored_while_heater_off();
   if (failures) { std::printf("%d check(s) failed\n", failures); return 1; }
   std::printf("all checks passed\n");
   return 0;

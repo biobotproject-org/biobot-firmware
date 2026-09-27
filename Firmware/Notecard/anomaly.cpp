@@ -40,19 +40,29 @@ bool Detector::Gate::feed(bool tripped, bool released, uint8_t confirm) {
 
 void Detector::learn(const Sample& s) {
   if (!baselineInit_) {
+    // Wait for a sample whose environmental channels are usable: seeding the
+    // baselines from a failed read would poison them with zeroes.
+    if (!s.envValid) return;
     bTemp_ = s.temperatureC;
     bHum_ = s.humidityPct;
-    bGas_ = s.gasResistanceKOhm;
-    bPm25_ = s.pmValid ? s.pm25 : 0;
+    bGas_ = s.gasValid ? s.gasResistanceKOhm : 0.0f;
+    bPm25_ = s.pmValid ? s.pm25 : 0.0f;
     baselineInit_ = true;
     return;
   }
   // During warmup learn fast so the baseline settles within a few samples;
   // afterwards learn slowly so an event cannot drag the baseline with it.
   const float a = (samplesSeen_ < cfg_.warmupSamples) ? 0.2f : cfg_.baselineAlpha;
-  bTemp_ += a * (s.temperatureC - bTemp_);
-  bHum_ += a * (s.humidityPct - bHum_);
-  bGas_ += a * (s.gasResistanceKOhm - bGas_);
+  if (s.envValid) {
+    bTemp_ += a * (s.temperatureC - bTemp_);
+    bHum_ += a * (s.humidityPct - bHum_);
+  }
+  if (s.gasValid) {
+    // Seed rather than ramp the first time gas becomes usable, e.g. after the
+    // heater has been off: ramping from zero would read as a huge rise.
+    if (bGas_ <= 0.0f) bGas_ = s.gasResistanceKOhm;
+    else bGas_ += a * (s.gasResistanceKOhm - bGas_);
+  }
   if (s.pmValid) bPm25_ += a * (s.pm25 - bPm25_);
 }
 
@@ -113,22 +123,24 @@ Result Detector::update(const Sample& s, uint32_t nowMs) {
   if (gPmCrit_.feed(pmUsable && s.pm25 >= cfg_.pm25CriticalUgm3,
                     !pmUsable || s.pm25 < cfg_.pm25CriticalUgm3 * cr, confirm))
     sig |= SIG_PM25_CRITICAL;
-  if (gTempHigh_.feed(s.temperatureC >= cfg_.tempHighC,
-                      s.temperatureC < cfg_.tempHighC - 5.0f, confirm))
+  if (gTempHigh_.feed(s.envValid && s.temperatureC >= cfg_.tempHighC,
+                      !s.envValid || s.temperatureC < cfg_.tempHighC - 5.0f, confirm))
     sig |= SIG_TEMP_HIGH;
 
   // --- Baseline-relative signals (only once the baseline is trusted) -------
   if (ready) {
     const float dT = s.temperatureC - bTemp_;
-    if (gTempRise_.feed(dT >= cfg_.tempRiseC, dT < cfg_.tempRiseC * cr, confirm))
+    if (gTempRise_.feed(s.envValid && dT >= cfg_.tempRiseC,
+                        !s.envValid || dT < cfg_.tempRiseC * cr, confirm))
       sig |= SIG_TEMP_RISE;
 
     const float dH = bHum_ - s.humidityPct;
-    if (gHumDrop_.feed(dH >= cfg_.humidityDropPct, dH < cfg_.humidityDropPct * cr, confirm))
+    if (gHumDrop_.feed(s.envValid && dH >= cfg_.humidityDropPct,
+                       !s.envValid || dH < cfg_.humidityDropPct * cr, confirm))
       sig |= SIG_HUMIDITY_DROP;
 
     // Guard against a zero baseline (sensor not warmed up) producing nonsense.
-    const bool gasOk = bGas_ > 0.5f && s.gasResistanceKOhm > 0.0f;
+    const bool gasOk = s.gasValid && bGas_ > 0.5f && s.gasResistanceKOhm > 0.0f;
     const float gasRatio = gasOk ? s.gasResistanceKOhm / bGas_ : 1.0f;
     // Release once the ratio recovers above the drop ratio plus a margin.
     const float gasRelease = cfg_.gasDropRatio + (1.0f - cfg_.gasDropRatio) * (1.0f - cr);
