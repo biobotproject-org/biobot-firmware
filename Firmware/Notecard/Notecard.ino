@@ -115,6 +115,7 @@ static uint8_t bmeAddr = 0;         // address it answered on, 0 if never found
 static uint8_t bmeFailures = 0;     // consecutive failed reads
 static uint32_t lastBmeRetryMs = 0;
 static bool bmeHeaterOn = true;
+static bool bmv080Ready = false;
 static uint32_t lastHeaterRetryMs = 0;
 
 static bool timeValid = false;       // the Notecard has given us the time once
@@ -468,6 +469,8 @@ static void bmeHeaterRetry() {
 // for a real failure and for "nothing new", so a single call at a 30 s cadence
 // misses far more often than it hits.
 static bool bmv080Read(uint32_t& waitedMs) {
+  waitedMs = 0;
+  if (!bmv080Ready) return false;  // its driver handle was never opened
   uint32_t start = millis();
   for (;;) {
     if (bmv080.readSensor()) {
@@ -480,13 +483,39 @@ static bool bmv080Read(uint32_t& waitedMs) {
   }
 }
 
+// Read the sensor, retrying once. Firmware/diagnostics/bme_diag reads this
+// sensor 8 times out of 8 with the node's exact settings when nothing else is
+// on the bus, so a read that fails here fails because of what else shares the
+// bus - and the first transfer after the Notecard has been talking is the one
+// that gets lost. A second attempt costs a few hundred milliseconds and tells
+// us plainly which of the two it was.
+static bool bmeReadWithRetry() {
+  if (bme.performReading()) return true;
+  uint8_t err = i2cProbe(bmeAddr);
+  delay(20);
+  if (!bme.performReading()) return false;
+  Serial.printf("[SENS] BME read failed then succeeded on retry (probe between: %u) - "
+                "the first transfer after Notecard traffic was lost\n", err);
+  return true;
+}
+
 static bool bmv080Begin() {
   if (!bmv080.begin(BMV080_ADDR, Wire)) {
-    Serial.println("[SETUP] BMV080 not found - check wiring");
+    Serial.println("[SETUP] BMV080 not found at 0x57 - check wiring");
     return false;
   }
-  bmv080.init();
-  bmv080.setMode(SF_BMV080_MODE_CONTINUOUS);
+  // These two were called with their results thrown away. init() is what opens
+  // the sensor and starts the Bosch driver behind it: if it fails, the sensor
+  // sits on the bus acknowledging probes and never produces a single sample,
+  // which is exactly what "no sample in 2500 ms, I2C error 0" looks like.
+  if (!bmv080.init()) {
+    Serial.println("[SETUP] BMV080 init() FAILED - it will answer on I2C but never measure");
+    return false;
+  }
+  if (!bmv080.setMode(SF_BMV080_MODE_CONTINUOUS)) {
+    Serial.println("[SETUP] BMV080 setMode(continuous) FAILED");
+    return false;
+  }
   Serial.println("[SETUP] BMV080 OK");
   return true;
 }
@@ -504,7 +533,7 @@ static bool readSensors(Reading& r) {
 
   if (!bmeReady) {
     bmeRecover("never initialised");
-  } else if (bme.performReading()) {
+  } else if (bmeReadWithRetry()) {
     bmeFailures = 0;
     r.envValid = true;
     r.temperatureC = bme.temperature;
@@ -544,8 +573,12 @@ static bool readSensors(Reading& r) {
     r.pm10 = bmv080.PM10();
     r.pmObstructed = bmv080.isObstructed();
   } else {
-    Serial.printf("[SENS] BMV080 gave no sample in %lu ms - 0x%02X I2C error %u\n",
-                  (unsigned long)pmWaitedMs, BMV080_ADDR, i2cProbe(BMV080_ADDR));
+    if (!bmv080Ready) {
+      Serial.println("[SENS] BMV080 unavailable - its driver never opened at boot");
+    } else {
+      Serial.printf("[SENS] BMV080 gave no sample in %lu ms - 0x%02X I2C error %u\n",
+                    (unsigned long)pmWaitedMs, BMV080_ADDR, i2cProbe(BMV080_ADDR));
+    }
   }
   return r.envValid || r.pmValid;
 }
@@ -687,12 +720,13 @@ void setup() {
   bmeReady = bmeBegin(true);
 
   Serial.println("[SETUP] Init BMV080...");
-  if (!bmv080Begin()) {
-    // Without the particulate sensor the node cannot do its main job.
-    while (true) {
-      Serial.println("[SETUP] HALTED - no BMV080");
-      delay(5000);
-    }
+  bmv080Ready = bmv080Begin();
+  if (!bmv080Ready) {
+    // Halting used to seem right - PM2.5 is the node's main job - but a halted
+    // node reports nothing at all, not even that it is broken. Carry on: the
+    // detector raises a sensor fault after ten failed particulate reads, which
+    // reaches the operator, and temperature and humidity still get logged.
+    Serial.println("[SETUP] WARNING: no particulate sensor - continuing without PM2.5");
   }
 
   notecardBegin();

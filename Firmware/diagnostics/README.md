@@ -29,3 +29,15 @@ Four configurations run in turn so one run separates the variables:
 
 Keep the 12 V supply connected while running it, so the rail is loaded the same
 way it is in normal operation.
+
+### Result on the first node, 2026-09-27
+
+Phase 1 — the node's exact configuration, gas heater and all — read the sensor
+**8 times out of 8**, each taking 330 ms, which is the full expected
+measurement window. So on that node the sensor, its lead, its connector and its
+supply are all sound, and the gas heater draws no more current than the rail can
+give. Every read failure seen in the node firmware was caused by something else
+sharing the I2C bus, not by the sensor.
+
+That is what the sketch is for: it turns "the sensor is broken" into "the sensor
+is fine, look elsewhere" in one run.
