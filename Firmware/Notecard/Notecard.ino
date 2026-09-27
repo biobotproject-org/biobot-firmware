@@ -123,6 +123,7 @@ static bool bmeHeaterOn = true;
 static bool bmv080Ready = false;
 static uint32_t lastBmv080RetryMs = 0;
 static uint32_t bmeRetries = 0;     // reads that needed a second attempt
+static bool pmFaultLogged = false;  // the per-sample PM complaint is printed once
 static uint32_t lastHeaterRetryMs = 0;
 
 static bool timeValid = false;       // the Notecard has given us the time once
@@ -558,6 +559,7 @@ static void bmv080Recover() {
   lastBmv080RetryMs = millis();
   Serial.println("[PM] retrying the particulate sensor");
   bmv080Ready = bmv080Begin();
+  if (bmv080Ready) pmFaultLogged = false;  // complain again if it drops out later
 }
 
 // Fill r from the sensors. The two sensors are read independently, so losing
@@ -619,7 +621,12 @@ static bool readSensors(Reading& r) {
     r.pmObstructed = bmv080.isObstructed();
   } else {
     if (!bmv080Ready) {
-      Serial.println("[SENS] BMV080 unavailable - its driver never opened at boot");
+      // Once is enough: the minute retry already reports the stage it fails at,
+      // so repeating this every sample only buries the readings that do work.
+      if (!pmFaultLogged) {
+        Serial.println("[SENS] BMV080 unavailable - its driver is not open; see the [PM] lines");
+        pmFaultLogged = true;
+      }
     } else {
       Serial.printf("[SENS] BMV080 gave no sample in %lu ms - 0x%02X I2C error %u\n",
                     (unsigned long)pmWaitedMs, BMV080_ADDR, i2cProbe(BMV080_ADDR));
