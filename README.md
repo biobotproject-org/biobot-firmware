@@ -194,6 +194,22 @@ long it waited and the sensor's I2C error:
 
 Error 0 there means the sensor is on the bus and simply produced nothing.
 
+### The first transfer after Notecard traffic gets lost
+
+Confirmed on the bench. `Firmware/diagnostics/bme_diag` reads the
+BME680/688 8 times out of 8 with the node's exact settings when nothing
+else is on the bus, and the same sensor fails every read in the node. The
+transfer that fails is always the first one after the Notecard has been
+talking, and a probe immediately afterwards returns error 2 while the next
+one returns 0 — the error belongs to the bus state left behind, not to the
+sensor.
+
+Two things handle it. Each sample spends a throwaway probe before reading,
+so the transfer that gets lost is that one rather than a measurement; and a
+read that still fails is retried once. The count of reads that needed the
+retry appears on the status line as `retries`. The particulate sensor's
+driver is opened the same way: three attempts at boot, then once a minute.
+
 ### Degraded operation
 
 The two sensors are read independently, so one failing does not silence

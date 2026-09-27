@@ -75,6 +75,11 @@ static const uint32_t BME_HEATER_RETRY_INTERVAL_MS = 60UL * 60UL * 1000UL;
 // answer.
 static const uint32_t BMV080_POLL_TIMEOUT_MS = 2500;
 
+// Its driver is retried the same way the BME's is: a sensor that would not open
+// at boot is not necessarily broken.
+static const uint8_t BMV080_BOOT_ATTEMPTS = 3;
+static const uint32_t BMV080_RETRY_INTERVAL_MS = 60UL * 1000UL;
+
 // Wall-clock time comes from the Notecard over the shared I2C bus, so it is
 // anchored once and carried forward on millis() instead of being re-fetched
 // for every sample.
@@ -116,6 +121,8 @@ static uint8_t bmeFailures = 0;     // consecutive failed reads
 static uint32_t lastBmeRetryMs = 0;
 static bool bmeHeaterOn = true;
 static bool bmv080Ready = false;
+static uint32_t lastBmv080RetryMs = 0;
+static uint32_t bmeRetries = 0;     // reads that needed a second attempt
 static uint32_t lastHeaterRetryMs = 0;
 
 static bool timeValid = false;       // the Notecard has given us the time once
@@ -494,14 +501,24 @@ static bool bmeReadWithRetry() {
   uint8_t err = i2cProbe(bmeAddr);
   delay(20);
   if (!bme.performReading()) return false;
-  Serial.printf("[SENS] BME read failed then succeeded on retry (probe between: %u) - "
-                "the first transfer after Notecard traffic was lost\n", err);
+  bmeRetries++;
+  // Say this once with the reasoning, then keep the count on the status line
+  // rather than repeating it every 30 s for the life of the node.
+  if (bmeRetries == 1) {
+    Serial.printf("[SENS] BME read failed then succeeded on retry (probe between: %u) - the "
+                  "first transfer after Notecard traffic gets lost; retries are counted on "
+                  "the status line from here on\n", err);
+  }
   return true;
 }
 
+// Bring the particulate sensor up, naming the stage that failed. Each stage is
+// a separate fault: an address that does not answer is wiring, a driver that
+// will not open is the Bosch SDK refusing, and a mode that will not set is the
+// sensor refusing to start measuring.
 static bool bmv080Begin() {
   if (!bmv080.begin(BMV080_ADDR, Wire)) {
-    Serial.println("[SETUP] BMV080 not found at 0x57 - check wiring");
+    Serial.println("[PM] begin() failed - nothing usable at 0x57");
     return false;
   }
   // These two were called with their results thrown away. init() is what opens
@@ -509,15 +526,38 @@ static bool bmv080Begin() {
   // sits on the bus acknowledging probes and never produces a single sample,
   // which is exactly what "no sample in 2500 ms, I2C error 0" looks like.
   if (!bmv080.init()) {
-    Serial.println("[SETUP] BMV080 init() FAILED - it will answer on I2C but never measure");
+    Serial.println("[PM] init() failed - the sensor answers on I2C but its driver "
+                   "would not open, so it will never measure");
     return false;
   }
   if (!bmv080.setMode(SF_BMV080_MODE_CONTINUOUS)) {
-    Serial.println("[SETUP] BMV080 setMode(continuous) FAILED");
+    Serial.println("[PM] setMode(continuous) failed - driver open but not measuring");
     return false;
   }
-  Serial.println("[SETUP] BMV080 OK");
+  Serial.println("[PM] ready");
   return true;
+}
+
+// The BME680/688 turned out to lose its first transfer after other traffic on
+// this bus; assume the particulate sensor can too, and do not give up on one
+// refusal.
+static bool bmv080BeginRetrying(uint8_t attempts) {
+  for (uint8_t i = 1; i <= attempts; i++) {
+    if (bmv080Begin()) return true;
+    if (i < attempts) {
+      Serial.printf("[PM] attempt %u of %u failed - retrying\n", i, attempts);
+      delay(500);
+    }
+  }
+  return false;
+}
+
+static void bmv080Recover() {
+  if (bmv080Ready) return;
+  if ((uint32_t)(millis() - lastBmv080RetryMs) < BMV080_RETRY_INTERVAL_MS) return;
+  lastBmv080RetryMs = millis();
+  Serial.println("[PM] retrying the particulate sensor");
+  bmv080Ready = bmv080Begin();
 }
 
 // Fill r from the sensors. The two sensors are read independently, so losing
@@ -530,6 +570,11 @@ static bool readSensors(Reading& r) {
   // Another library sharing this bus (the Notecard) can leave the clock where
   // it wants it; put it back before touching the sensors.
   Wire.setClock(I2C_CLOCK_HZ);
+
+  // Spend a throwaway transfer first. The transfer that follows Notecard
+  // traffic is the one that gets lost, so let it be this one rather than a
+  // measurement: it is why the retry below almost always succeeds.
+  if (bmeReady) i2cProbe(bmeAddr);
 
   if (!bmeReady) {
     bmeRecover("never initialised");
@@ -682,13 +727,14 @@ static void taskStatus() {
   lastStatusMs = millis();
   uint32_t sinceSend = millis() - lastDataSendMs;
   uint32_t untilSend = sinceSend >= DATA_SEND_INTERVAL_MS ? 0 : DATA_SEND_INTERVAL_MS - sinceSend;
-  Serial.printf("\n[STATUS] up %lu s | heap %u | registered %s | bme %s | buffer %u/%u | "
-                "dropped %lu | severity %s | next send in %lu s\n\n",
+  Serial.printf("\n[STATUS] up %lu s | heap %u | registered %s | bme %s | pm %s | buffer %u/%u | "
+                "dropped %lu | retries %lu | severity %s | next send in %lu s\n\n",
                 (unsigned long)(millis() / 1000), (unsigned)ESP.getFreeHeap(),
                 deviceRegistered ? "yes" : "no",
                 bmeReady ? (bmeHeaterOn ? "ok" : "ok, no gas") : "FAULT",
+                bmv080Ready ? "ok" : "FAULT",
                 bufferCount, BUFFER_CAPACITY,
-                (unsigned long)droppedReadings,
+                (unsigned long)droppedReadings, (unsigned long)bmeRetries,
                 biobot::Detector::severityName(detector.severity()),
                 (unsigned long)(untilSend / 1000));
 }
@@ -720,7 +766,8 @@ void setup() {
   bmeReady = bmeBegin(true);
 
   Serial.println("[SETUP] Init BMV080...");
-  bmv080Ready = bmv080Begin();
+  bmv080Ready = bmv080BeginRetrying(BMV080_BOOT_ATTEMPTS);
+  lastBmv080RetryMs = millis();
   if (!bmv080Ready) {
     // Halting used to seem right - PM2.5 is the node's main job - but a halted
     // node reports nothing at all, not even that it is broken. Carry on: the
@@ -739,6 +786,7 @@ void setup() {
 void loop() {
   taskRegister();
   bmeHeaterRetry();
+  bmv080Recover();
   taskSample();
   taskSend();
   taskStatus();
