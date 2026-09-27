@@ -180,6 +180,20 @@ and the fix is electrical, not firmware: a shorter lead to the sensor, a
 10 µF bulk plus 100 nF ceramic across its 3V3 and GND at the sensor end,
 or a supply that is not shared with the Notecard's modem.
 
+### The BMV080 and "read failed"
+
+`readSensor()` returns false both for a real error and for "no new sample
+yet", and in continuous mode the sensor produces a sample about once a
+second. Asking once every 30 s therefore misses more often than it hits, so
+the node polls for up to 2.5 s and only then reports a failure, with how
+long it waited and the sensor's I2C error:
+
+```
+[SENS] BMV080 gave no sample in 2500 ms - 0x57 I2C error 0
+```
+
+Error 0 there means the sensor is on the bus and simply produced nothing.
+
 ### Degraded operation
 
 The two sensors are read independently, so one failing does not silence

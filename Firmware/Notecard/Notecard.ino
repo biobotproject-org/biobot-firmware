@@ -69,6 +69,12 @@ static const uint16_t BME_HEATER_MS = 150;
 static const uint8_t BME_HEATER_OFF_AFTER_FAILURES = 3;
 static const uint32_t BME_HEATER_RETRY_INTERVAL_MS = 60UL * 60UL * 1000UL;
 
+// The BMV080 reports "no new sample yet" the same way it reports an error, and
+// in continuous mode it produces a sample roughly once a second. Sampling every
+// 30 s therefore has to wait for one rather than take the first no for an
+// answer.
+static const uint32_t BMV080_POLL_TIMEOUT_MS = 2500;
+
 // Wall-clock time comes from the Notecard over the shared I2C bus, so it is
 // anchored once and carried forward on millis() instead of being re-fetched
 // for every sample.
@@ -431,7 +437,6 @@ static bool bmeBegin(bool warmup) {
       lastHeaterRetryMs = millis();
     }
   }
-  bmeFailures = 0;
   return true;
 }
 
@@ -457,6 +462,22 @@ static void bmeHeaterRetry() {
   bmeHeaterOn = true;
   lastBmeRetryMs = millis() - BME_RETRY_INTERVAL_MS;  // let recovery run at once
   bmeRecover("heater re-enabled");
+}
+
+// Wait for a sample instead of asking once. readSensor() returns false both
+// for a real failure and for "nothing new", so a single call at a 30 s cadence
+// misses far more often than it hits.
+static bool bmv080Read(uint32_t& waitedMs) {
+  uint32_t start = millis();
+  for (;;) {
+    if (bmv080.readSensor()) {
+      waitedMs = millis() - start;
+      return true;
+    }
+    waitedMs = millis() - start;
+    if (waitedMs >= BMV080_POLL_TIMEOUT_MS) return false;
+    delay(20);
+  }
 }
 
 static bool bmv080Begin() {
@@ -515,14 +536,16 @@ static bool readSensors(Reading& r) {
     bmeRecover("read failed");
   }
 
-  r.pmValid = bmv080.readSensor();
+  uint32_t pmWaitedMs = 0;
+  r.pmValid = bmv080Read(pmWaitedMs);
   if (r.pmValid) {
     r.pm1 = bmv080.PM1();
     r.pm25 = bmv080.PM25();
     r.pm10 = bmv080.PM10();
     r.pmObstructed = bmv080.isObstructed();
   } else {
-    Serial.println("[SENS] BMV080 read failed");
+    Serial.printf("[SENS] BMV080 gave no sample in %lu ms - 0x%02X I2C error %u\n",
+                  (unsigned long)pmWaitedMs, BMV080_ADDR, i2cProbe(BMV080_ADDR));
   }
   return r.envValid || r.pmValid;
 }
