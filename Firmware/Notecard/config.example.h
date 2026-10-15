@@ -9,11 +9,13 @@
 // Blues Notehub product UID for this fleet (Notehub -> Project -> Settings).
 #define NOTEHUB_PRODUCT_UID "com.example.you:biobot"
 
-// "continuous" keeps the modem connected and delivers batches immediately.
-// "periodic" is far kinder to a solar battery; the Notecard then syncs on its
-// own schedule, but alert notes are still pushed immediately because they are
-// added with sync:true.
-#define NOTEHUB_MODE "continuous"
+// "periodic" lets the modem sleep between syncs. Every batch and every alert
+// is added with sync:true, so delivery timing is unchanged - the only thing
+// that changes is that the modem is not holding a tower connection for the
+// 599 seconds out of every 600 when it has nothing to say. On the bench this
+// is the difference between ~44 mA and ~4 mA average for the Notecard.
+// "continuous" keeps the connection up permanently; use it only on mains.
+#define NOTEHUB_MODE "periodic"
 
 // This node.
 #define DEVICE_ID "biobot-001"

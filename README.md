@@ -180,35 +180,20 @@ and the fix is electrical, not firmware: a shorter lead to the sensor, a
 10 µF bulk plus 100 nF ceramic across its 3V3 and GND at the sensor end,
 or a supply that is not shared with the Notecard's modem.
 
-### The BMV080 and "read failed"
+### The BMV080 runs duty-cycled
 
-`readSensor()` returns false both for a real error and for "no new sample
-yet", and in continuous mode the sensor produces a sample about once a
-second. Asking once every 30 s therefore misses more often than it hits, so
-the node polls for up to 2.5 s and only then reports a failure, with how
-long it waited and the sensor's I2C error:
+The sensor measures once every 20 s on its own clock and sleeps between,
+instead of producing a sample every second in continuous mode. The loop
+services its driver every 250 ms and caches each result as it arrives; a
+sample reads the cache. A cached result older than three periods (60 s) is
+treated as a fault:
 
 ```
-[SENS] BMV080 gave no sample in 2500 ms - 0x57 I2C error 0
+[SENS] BMV080 last sample is 74 s old (limit 60 s) - 0x57 I2C error 0
 ```
 
-Error 0 there means the sensor is on the bus and simply produced nothing.
-
-### The first transfer after Notecard traffic gets lost
-
-Confirmed on the bench. `Firmware/diagnostics/bme_diag` reads the
-BME680/688 8 times out of 8 with the node's exact settings when nothing
-else is on the bus, and the same sensor fails every read in the node. The
-transfer that fails is always the first one after the Notecard has been
-talking, and a probe immediately afterwards returns error 2 while the next
-one returns 0 — the error belongs to the bus state left behind, not to the
-sensor.
-
-Two things handle it. Each sample spends a throwaway probe before reading,
-so the transfer that gets lost is that one rather than a measurement; and a
-read that still fails is retried once. The count of reads that needed the
-retry appears on the status line as `retries`. The particulate sensor's
-driver is opened the same way: three attempts at boot, then once a minute.
+Continuous mode was 182 mW, a third of the node's power budget, for 29
+samples in every 30 that were never used.
 
 ### Degraded operation
 
@@ -224,6 +209,31 @@ drop and trip a false alert; there is a host test covering exactly that.
 Network time is fetched from the Notecard once and carried forward on
 `millis()`, re-anchored hourly, rather than fetched for every sample. That
 keeps 20 of every 21 Notecard transactions off the bus the sensors share.
+
+## Power
+
+Measured on the first node with a 3000 mAh (33 Wh) pack and the panel in
+poor light, the original firmware flattened the battery in three days. The
+budget behind that, from datasheets and the firmware's duty cycle:
+
+| Load | At 12 V | Share |
+| --- | --- | --- |
+| BMV080, continuous | 333 mW | 34 % |
+| Nano ESP32, never sleeps | 274 mW | 28 % |
+| Notecard, `continuous` mode | 262 mW | 26 % |
+| Charge controller self-consumption | 120 mW | 12 % |
+| BME688 | 0.5 mW | — |
+| **Total** | **~990 mW, ~24 Wh/day** | |
+
+Two of the three large loads are settings:
+
+- **BMV080 duty cycling** (this firmware) removes most of the first row.
+- **`NOTEHUB_MODE "periodic"`** in `config.h` removes most of the third. Every
+  note the node sends is added with `sync:true`, so batches and alerts still
+  go out immediately; the modem just drops the tower connection in between.
+
+Together they take the node to roughly 11 Wh/day. Putting the ESP32 to
+sleep between samples is the remaining lever and is not done yet.
 
 ## Testing the detector on your computer
 

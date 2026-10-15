@@ -69,11 +69,15 @@ static const uint16_t BME_HEATER_MS = 150;
 static const uint8_t BME_HEATER_OFF_AFTER_FAILURES = 3;
 static const uint32_t BME_HEATER_RETRY_INTERVAL_MS = 60UL * 60UL * 1000UL;
 
-// The BMV080 reports "no new sample yet" the same way it reports an error, and
-// in continuous mode it produces a sample roughly once a second. Sampling every
-// 30 s therefore has to wait for one rather than take the first no for an
-// answer.
-static const uint32_t BMV080_POLL_TIMEOUT_MS = 2500;
+// Continuous mode cost 182 mW to produce a sample every second, 29 of every
+// 30 of which were thrown away - a third of the node's whole power budget.
+// Duty cycling wakes the sensor once per period instead. 20 s is shorter than
+// the 30 s sample interval, so every sample window holds a fresh result no
+// matter how the two clocks drift. Results are cached as they arrive and a
+// sample reads the cache, so nothing ever waits on the sensor.
+static const uint16_t BMV080_DUTY_PERIOD_S = 20;
+static const uint32_t PM_SERVICE_INTERVAL_MS = 250;                        // cache refresh
+static const uint32_t PM_STALE_MS = 3UL * BMV080_DUTY_PERIOD_S * 1000UL;   // older is a fault
 
 // Its driver is retried the same way the BME's is: a sensor that would not open
 // at boot is not necessarily broken.
@@ -122,6 +126,16 @@ static uint32_t lastBmeRetryMs = 0;
 static bool bmeHeaterOn = true;
 static bool bmv080Ready = false;
 static uint32_t lastBmv080RetryMs = 0;
+
+// The particulate sensor's most recent result, filled in by taskPm().
+struct PmSample {
+  float pm1, pm25, pm10;
+  bool obstructed;
+  uint32_t atMs;
+  bool valid;
+};
+static PmSample pmCache = {0, 0, 0, false, 0, false};
+static uint32_t lastPmServiceMs = 0;
 static uint32_t bmeRetries = 0;     // reads that needed a second attempt
 static bool pmFaultLogged = false;  // the per-sample PM complaint is printed once
 static uint32_t lastHeaterRetryMs = 0;
@@ -473,22 +487,21 @@ static void bmeHeaterRetry() {
   bmeRecover("heater re-enabled");
 }
 
-// Wait for a sample instead of asking once. readSensor() returns false both
-// for a real failure and for "nothing new", so a single call at a 30 s cadence
-// misses far more often than it hits.
-static bool bmv080Read(uint32_t& waitedMs) {
-  waitedMs = 0;
-  if (!bmv080Ready) return false;  // its driver handle was never opened
-  uint32_t start = millis();
-  for (;;) {
-    if (bmv080.readSensor()) {
-      waitedMs = millis() - start;
-      return true;
-    }
-    waitedMs = millis() - start;
-    if (waitedMs >= BMV080_POLL_TIMEOUT_MS) return false;
-    delay(20);
-  }
+// Service the particulate sensor's driver and cache whatever it produces. In
+// duty-cycling mode the sensor measures on its own clock and readSensor()
+// returns true exactly once per result, so this runs from the loop all the
+// time and the sample task reads the cache rather than the sensor.
+static void taskPm() {
+  if (!bmv080Ready) return;
+  if ((uint32_t)(millis() - lastPmServiceMs) < PM_SERVICE_INTERVAL_MS) return;
+  lastPmServiceMs = millis();
+  if (!bmv080.readSensor()) return;
+  pmCache.pm1 = bmv080.PM1();
+  pmCache.pm25 = bmv080.PM25();
+  pmCache.pm10 = bmv080.PM10();
+  pmCache.obstructed = bmv080.isObstructed();
+  pmCache.atMs = millis();
+  pmCache.valid = true;
 }
 
 // Read the sensor, retrying once. Firmware/diagnostics/bme_diag reads this
@@ -531,11 +544,18 @@ static bool bmv080Begin() {
                    "would not open, so it will never measure");
     return false;
   }
-  if (!bmv080.setMode(SF_BMV080_MODE_CONTINUOUS)) {
-    Serial.println("[PM] setMode(continuous) failed - driver open but not measuring");
+  // Period before mode: the Bosch driver takes its parameters before a
+  // measurement starts, not during one.
+  if (!bmv080.setDutyCyclingPeriod(BMV080_DUTY_PERIOD_S)) {
+    Serial.println("[PM] setDutyCyclingPeriod() failed");
     return false;
   }
-  Serial.println("[PM] ready");
+  if (!bmv080.setMode(SF_BMV080_MODE_DUTY_CYCLE)) {
+    Serial.println("[PM] setMode(duty cycle) failed - driver open but not measuring");
+    return false;
+  }
+  pmCache.valid = false;  // nothing from before a (re)start is trusted
+  Serial.printf("[PM] ready - duty cycling, one sample every %u s\n", BMV080_DUTY_PERIOD_S);
   return true;
 }
 
@@ -612,13 +632,13 @@ static bool readSensors(Reading& r) {
     bmeRecover("read failed");
   }
 
-  uint32_t pmWaitedMs = 0;
-  r.pmValid = bmv080Read(pmWaitedMs);
+  uint32_t pmAgeMs = pmCache.valid ? (uint32_t)(millis() - pmCache.atMs) : 0;
+  r.pmValid = bmv080Ready && pmCache.valid && pmAgeMs < PM_STALE_MS;
   if (r.pmValid) {
-    r.pm1 = bmv080.PM1();
-    r.pm25 = bmv080.PM25();
-    r.pm10 = bmv080.PM10();
-    r.pmObstructed = bmv080.isObstructed();
+    r.pm1 = pmCache.pm1;
+    r.pm25 = pmCache.pm25;
+    r.pm10 = pmCache.pm10;
+    r.pmObstructed = pmCache.obstructed;
   } else {
     if (!bmv080Ready) {
       // Once is enough: the minute retry already reports the stage it fails at,
@@ -627,9 +647,12 @@ static bool readSensors(Reading& r) {
         Serial.println("[SENS] BMV080 unavailable - its driver is not open; see the [PM] lines");
         pmFaultLogged = true;
       }
+    } else if (!pmCache.valid) {
+      Serial.println("[SENS] BMV080 has not produced its first sample yet");
     } else {
-      Serial.printf("[SENS] BMV080 gave no sample in %lu ms - 0x%02X I2C error %u\n",
-                    (unsigned long)pmWaitedMs, BMV080_ADDR, i2cProbe(BMV080_ADDR));
+      Serial.printf("[SENS] BMV080 last sample is %lu s old (limit %lu s) - 0x%02X I2C error %u\n",
+                    (unsigned long)(pmAgeMs / 1000), (unsigned long)(PM_STALE_MS / 1000),
+                    BMV080_ADDR, i2cProbe(BMV080_ADDR));
     }
   }
   return r.envValid || r.pmValid;
@@ -739,7 +762,7 @@ static void taskStatus() {
                 (unsigned long)(millis() / 1000), (unsigned)ESP.getFreeHeap(),
                 deviceRegistered ? "yes" : "no",
                 bmeReady ? (bmeHeaterOn ? "ok" : "ok, no gas") : "FAULT",
-                bmv080Ready ? "ok" : "FAULT",
+                bmv080Ready ? (pmCache.valid ? "ok" : "ok, waiting") : "FAULT",
                 bufferCount, BUFFER_CAPACITY,
                 (unsigned long)droppedReadings, (unsigned long)bmeRetries,
                 biobot::Detector::severityName(detector.severity()),
@@ -794,6 +817,7 @@ void loop() {
   taskRegister();
   bmeHeaterRetry();
   bmv080Recover();
+  taskPm();
   taskSample();
   taskSend();
   taskStatus();
