@@ -37,6 +37,7 @@
 #include "SparkFun_BMV080_Arduino_Library.h"
 #include <Notecard.h>
 #include <esp_sleep.h>
+#include <esp_system.h>
 
 #include "config.h"
 #include "anomaly.h"
@@ -58,6 +59,11 @@ static const uint8_t NOTECARD_ADDR = 0x17;
 static const uint32_t SENSOR_READ_INTERVAL_MS = 60UL * 1000UL;        // 60 s
 static const uint32_t DATA_SEND_INTERVAL_MS = 20UL * 60UL * 1000UL;   // 20 min
 static const uint32_t SEND_RETRY_INTERVAL_MS = 60UL * 1000UL;         // after a failed batch
+// The first batch goes out as soon as a few readings exist, so a fresh flash
+// shows up in Notehub within minutes instead of after a full send interval.
+static const uint8_t FIRST_BATCH_READINGS = 3;
+// How long after a sync request to ask the Notecard how it went.
+static const uint32_t SYNC_CHECK_DELAY_MS = 45UL * 1000UL;
 static const uint32_t REGISTER_RETRY_INTERVAL_MS = 5UL * 1000UL;
 static const uint32_t STATUS_PRINT_INTERVAL_MS = 60UL * 1000UL;
 
@@ -192,6 +198,7 @@ static bool sleepRejectedLogged = false;
 // status tasks above them. Spelled out rather than left to the IDE's
 // prototype generation.
 static const char* batteryStatus();
+static void hubSync();
 static void attachBattery(Reading& r);
 static uint32_t bmeRetries = 0;     // reads that needed a second attempt
 static bool pmFaultLogged = false;  // the per-sample PM complaint is printed once
@@ -209,6 +216,8 @@ static uint32_t lastDataSendMs = 0;
 static uint32_t lastRegisterMs = 0;
 static uint32_t lastStatusMs = 0;
 static uint32_t nextSendNotBeforeMs = 0;
+static bool firstBatchSent = false;
+static uint32_t syncCheckDueMs = 0;      // 0 = no check pending
 
 // ---------------------------------------------------------------------------
 // Small helpers
@@ -255,7 +264,8 @@ static bool nowIso(char* out, size_t outSize) {
   return true;
 }
 
-// Queue a note. Ownership of body passes to the request.
+// Queue a note. Ownership of body passes to the request. The Notecard's
+// answer is read back so a refused note is logged instead of silently lost.
 static bool noteAdd(const char* file, J* body, bool sync) {
   J* req = notecard.newRequest("note.add");
   if (!req) {
@@ -265,7 +275,56 @@ static bool noteAdd(const char* file, J* body, bool sync) {
   JAddStringToObject(req, "file", file);
   JAddBoolToObject(req, "sync", sync);
   JAddItemToObject(req, "body", body);
-  return notecard.sendRequest(req);
+  J* rsp = notecard.requestAndResponse(req);
+  if (!rsp) {
+    Serial.printf("[NC] note.add %s: no response\n", file);
+    return false;
+  }
+  bool ok = true;
+  if (notecard.responseError(rsp)) {
+    Serial.printf("[NC] note.add %s: %s\n", file, JGetString(rsp, "err"));
+    ok = false;
+  } else {
+    Serial.printf("[NC] note.add %s: ok, %d note(s) waiting in that file\n", file, (int)JGetNumber(rsp, "total"));
+  }
+  notecard.deleteResponse(rsp);
+  return ok;
+}
+
+// Ask the Notecard to connect and push its outbox now. sync:true on note.add
+// is meant to do this on its own, but an explicit request costs nothing and
+// leaves no doubt. The result is checked SYNC_CHECK_DELAY_MS later.
+static void hubSync() {
+  J* req = notecard.newRequest("hub.sync");
+  if (!req) return;
+  if (notecard.sendRequest(req)) {
+    Serial.println("[NC] sync requested");
+  } else {
+    Serial.println("[NC] hub.sync was refused");
+  }
+  syncCheckDueMs = millis() + SYNC_CHECK_DELAY_MS;
+  if (syncCheckDueMs == 0) syncCheckDueMs = 1;
+}
+
+// One-shot report on how the last sync went, so a modem that never connects
+// is visible on the serial monitor rather than only as a gap in Notehub.
+static void taskSyncCheck() {
+  if (syncCheckDueMs == 0 || (int32_t)(millis() - syncCheckDueMs) < 0) return;
+  syncCheckDueMs = 0;
+  J* req = notecard.newRequest("hub.sync.status");
+  if (!req) return;
+  J* rsp = notecard.requestAndResponse(req);
+  if (!rsp) {
+    Serial.println("[NC] sync status: no response");
+    return;
+  }
+  const char* status = JGetString(rsp, "status");
+  Serial.printf("[NC] sync status: %s | completed %d s ago | requested %d s ago%s%s\n",
+                status && status[0] ? status : "(none)",
+                (int)JGetNumber(rsp, "completed"), (int)JGetNumber(rsp, "requested"),
+                JGetBool(rsp, "sync") ? " | sync in progress" : "",
+                JGetBool(rsp, "alert") ? " | ALERT: last sync failed" : "");
+  notecard.deleteResponse(rsp);
 }
 
 static void addReading(J* arr, const char* type, const char* unit, float value,
@@ -301,6 +360,15 @@ static void notecardBegin() {
     JAddStringToObject(req, "product", NOTEHUB_PRODUCT_UID);
     JAddStringToObject(req, "mode", NOTEHUB_MODE);
     notecard.sendRequest(req);
+  }
+
+  // Read the settings back so a typo in config.h shows up here, not in Notehub.
+  J* get = notecard.newRequest("hub.get");
+  J* cfg = get ? notecard.requestAndResponse(get) : nullptr;
+  if (cfg) {
+    Serial.printf("[NC] product %s | mode %s | device %s\n",
+                  JGetString(cfg, "product"), JGetString(cfg, "mode"), JGetString(cfg, "device"));
+    notecard.deleteResponse(cfg);
   }
   Serial.println("[NC] Ready");
 }
@@ -406,7 +474,9 @@ static bool sendAlert(const Reading& r, const biobot::Result& res, const char* e
     JAddNumberToObject(baseline, "pm25", res.baselinePm25);
   }
 
-  return noteAdd("alert.qo", body, true);
+  bool ok = noteAdd("alert.qo", body, true);
+  if (ok) hubSync();
+  return ok;
 }
 
 // ---------------------------------------------------------------------------
@@ -803,7 +873,8 @@ static void taskSend() {
   uint32_t now = millis();
   bool intervalDue = (uint32_t)(now - lastDataSendMs) >= DATA_SEND_INTERVAL_MS;
   bool batchFull = bufferCount >= BATCH_SIZE;
-  if (!intervalDue && !batchFull) return;
+  bool firstDue = !firstBatchSent && bufferCount >= FIRST_BATCH_READINGS;
+  if (!intervalDue && !batchFull && !firstDue) return;
   if ((int32_t)(now - nextSendNotBeforeMs) < 0) return;  // backing off after a failure
 
   Serial.printf("[SEND] Sending %u readings...\n", bufferCount);
@@ -812,6 +883,8 @@ static void taskSend() {
     bufferCount = 0;
     lastDataSendMs = now;
     nextSendNotBeforeMs = now;
+    firstBatchSent = true;
+    hubSync();
   } else {
     Serial.printf("[SEND] Failed - retrying in %lu s\n", (unsigned long)(SEND_RETRY_INTERVAL_MS / 1000));
     nextSendNotBeforeMs = now + SEND_RETRY_INTERVAL_MS;
@@ -932,6 +1005,24 @@ static void idle() {
   sleptMs += slept;
 }
 
+// Why the chip last restarted. Anything but "power on" or "software reset"
+// means the node went down on its own.
+static const char* resetReasonName(esp_reset_reason_t r) {
+  switch (r) {
+    case ESP_RST_POWERON: return "power on";
+    case ESP_RST_SW: return "software reset (reflash or reset button)";
+    case ESP_RST_PANIC: return "CRASH (firmware panic)";
+    case ESP_RST_INT_WDT: return "CRASH (interrupt watchdog)";
+    case ESP_RST_TASK_WDT: return "CRASH (task watchdog)";
+    case ESP_RST_WDT: return "CRASH (other watchdog)";
+    case ESP_RST_BROWNOUT: return "BROWNOUT (supply voltage dipped)";
+    case ESP_RST_DEEPSLEEP: return "deep sleep wake";
+    case ESP_RST_EXT: return "external reset pin";
+    case ESP_RST_SDIO: return "SDIO reset";
+    default: return "unknown";
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Arduino entry points
 // ---------------------------------------------------------------------------
@@ -950,7 +1041,8 @@ void setup() {
   Serial.printf("Battery:       %s\n", VICTRON_BLE_ENABLED ? "Victron BLE readout" : "off");
   Serial.printf("Batch size:    %u readings (buffer %u)\n", BATCH_SIZE, BUFFER_CAPACITY);
   Serial.printf("Batches/month: ~%lu\n", (unsigned long)((30UL * 24UL * 3600UL * 1000UL) / DATA_SEND_INTERVAL_MS));
-  Serial.printf("Free heap:     %u bytes\n\n", (unsigned)ESP.getFreeHeap());
+  Serial.printf("Free heap:     %u bytes\n", (unsigned)ESP.getFreeHeap());
+  Serial.printf("Last reset:    %s\n\n", resetReasonName(esp_reset_reason()));
 
   Serial.println("[SETUP] Init I2C...");
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
@@ -1000,6 +1092,7 @@ void loop() {
   taskSample();
   taskBattery();
   taskSend();
+  taskSyncCheck();
   taskStatus();
   idle();
 }

@@ -41,7 +41,19 @@ Battery:       Victron BLE readout
 [BATT] 12.43 V, +0.3 A, PV 6 W, today 0.02 kWh, bulk, rssi -61
 [SENS] T:21.4°C H:38.2% P:975.1hPa Gas:31.2kΩ PM2.5:2.1 Batt:12.43V 2026-...
 [STATUS] up 120 s | ... | batt 12.43V bulk | ... | asleep 0% (0 ticks)
+[SEND] Sending 3 readings...
+[NC] note.add data.qo: ok, 1 note(s) waiting in that file
+[SEND] Queued 3 readings
+[NC] sync requested
+[NC] sync status: completed {sync-end} | completed 12 s ago | requested 40 s ago
 ```
+
+The first batch leaves after three readings (about five minutes from boot, as
+the two warm-up samples are not buffered), so a `data.qo` event should appear
+in Notehub within six or seven minutes of flashing. After that batches go out
+every 20 minutes. The boot banner also prints `Last reset:`; anything marked
+CRASH or BROWNOUT means the node restarted on its own, which is worth
+reporting along with what it was doing just before.
 
 With the monitor open the node does not sleep (`asleep 0%`), which is the
 point of mode 1: everything else is exactly as it will run in the field.
@@ -60,6 +72,9 @@ should read `asleep 90%` or better. Then put it back to 1 for deployment.
 | `not a solar charger record` on every advert | another Victron product nearby; the solar charger will also show |
 | `light sleep rejected` | the core refused light sleep; the node falls back to delay and keeps running |
 | `asleep` stays at 0% in mode 2 | sleep is being entered and left instantly; report the ticks count |
+| `note.add data.qo: ` followed by an error | the Notecard refused the batch; the text is its reason |
+| `sync status: ... ALERT: last sync failed` | the modem could not reach Notehub; check the antenna, signal and the product UID in config.h |
+| `device.qo` reaches Notehub but `data.qo` never does | the node is restarting before its first batch; see `Last reset:` in the boot banner |
 
 ## What to report back
 
