@@ -1,6 +1,6 @@
-# BioBot firmware
+# Wildfire Alarm firmware
 
-Firmware for the BioBot wildfire-watch sensor node: an open, low-cost module
+Firmware for the Wildfire Alarm sensor node: an open, low-cost module
 that towns and volunteers place at the forest edge to catch early signs of
 smoke and fire. See the mission document for the bigger picture.
 
@@ -15,7 +15,7 @@ Every 30 seconds the node reads:
 
 Each sample goes through the on-device anomaly detector, then into a buffer.
 A Blues Notecard cellular modem carries three kinds of notes to Notehub, which
-routes them to the BioBot API:
+routes them to the Wildfire Alarm API:
 
 | Note file | When | Contents |
 | --- | --- | --- |
